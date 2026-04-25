@@ -1428,6 +1428,31 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 	// they would revert (WrongBlockNumber) on inclusion, so keeping
 	// them around just wastes propagation bandwidth and validator gas.
 	pool.evictStaleVotes(newHead.Number.Uint64())
+
+	// Refresh the paymaster fairness factor from the oracle's cached
+	// median price + health. Lets the priced heap compare iQRL-paid
+	// txs against native-paid txs in QRL-equivalent terms.
+	pool.refreshPaymasterFactor()
+}
+
+// refreshPaymasterFactor recomputes the oracle's median price +
+// health from raw validator votes and pushes the resulting iQRL→QRL
+// conversion factor into the priced heap. Bypasses the on-chain
+// per-block cache, which may be stale by one or more blocks if no
+// recent tx poked it.
+//
+// Safe to call without the oracle predeploy installed (returns a
+// zero/unhealthy reading, which deactivates the factor).
+func (pool *LegacyPool) refreshPaymasterFactor() {
+	if pool.currentState == nil {
+		return
+	}
+	currentBlock := uint64(0)
+	if head := pool.currentHead.Load(); head != nil {
+		currentBlock = head.Number.Uint64()
+	}
+	price, healthy := core.ComputeOraclePrice(pool.currentState, currentBlock)
+	pool.priced.SetPaymasterFactor(price, healthy)
 }
 
 // evictStaleVotes removes any submitVote() tx whose target

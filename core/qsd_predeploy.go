@@ -10,10 +10,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 
 	"github.com/theQRL/go-qrl/common"
 	"github.com/theQRL/go-qrl/crypto"
+)
+
+// Voting parameters baked into the ValidatorOracle bytecode at the
+// genesis predeploy. They are immutable in Solidity (constructor
+// arguments stored as `immutable` fields), so the only way to read
+// them off-chain without ABI calls is to mirror them as Go
+// constants. Keep these in lockstep with
+// qsd-contracts/script/Predeploy.s.sol.
+const (
+	OracleVoteStalenessBlocks  = 10
+	OracleMinQuorumNumerator   = 2
+	OracleMinQuorumDenominator = 3
 )
 
 // SubmitVoteSelector is the 4-byte function selector for
@@ -39,6 +52,7 @@ const (
 	validatorOracleValidatorsLengthSlot = 1
 	validatorOracleValidatorIndexSlot   = 2
 	validatorOracleVotesSlot            = 3
+	validatorOracleCacheSlot            = 4
 )
 
 // QSD Stability Layer: addresses reserved for the on-chain primitives
@@ -276,4 +290,77 @@ func mappingSlot(key []byte, slot uint64) common.Hash {
 		slotPadded[31-i] = byte(slot >> (8 * i))
 	}
 	return crypto.Keccak256Hash(keyPadded, slotPadded)
+}
+
+// OracleStorageReader is the slice of state.StateDB that
+// ComputeOraclePrice needs. Lifted to an interface so non-state
+// callers (test fakes, future RPC backends) can use the same logic.
+type OracleStorageReader interface {
+	GetState(addr common.Address, slot common.Hash) common.Hash
+}
+
+// ComputeOraclePrice off-chain-recomputes the (medianPrice, healthy)
+// pair that the on-chain ValidatorOracle.price() and healthy()
+// functions would return at `currentBlock`. Reads raw `validators[]`
+// and `votes[]` storage; ignores the per-block cache slot, since
+// the cache may be stale by one or more blocks if no recent tx
+// poked it.
+//
+// Logic mirrors src/ValidatorOracle.sol:
+//
+//   - load validators[]; if empty, return (0, false).
+//   - per-validator: load votes[v]. Drop if price == 0 or vote is
+//     older than OracleVoteStalenessBlocks blocks.
+//   - healthy = (fresh count) * QuorumDenom >= QuorumNum * total.
+//   - median of fresh prices (lower of the two middle values for
+//     even counts, matching the contract's integer-division avg).
+func ComputeOraclePrice(state OracleStorageReader, currentBlock uint64) (*big.Int, bool) {
+	lengthSlot := common.Hash{}
+	lengthSlot[31] = byte(validatorOracleValidatorsLengthSlot)
+	total := state.GetState(ValidatorOracleAddress, lengthSlot).Big().Uint64()
+	if total == 0 {
+		return new(big.Int), false
+	}
+
+	threshold := uint64(0)
+	if currentBlock > OracleVoteStalenessBlocks {
+		threshold = currentBlock - OracleVoteStalenessBlocks
+	}
+
+	// Dynamic-array element 0 lives at keccak256(slot 1); subsequent
+	// elements are at consecutive slots.
+	arrayBase := crypto.Keccak256Hash(common.LeftPadBytes(
+		big.NewInt(validatorOracleValidatorsLengthSlot).Bytes(), 32))
+	arrayBaseInt := new(big.Int).SetBytes(arrayBase.Bytes())
+
+	var fresh []*big.Int
+	for i := uint64(0); i < total; i++ {
+		idxInt := new(big.Int).Add(arrayBaseInt, new(big.Int).SetUint64(i))
+		validator := common.BytesToAddress(
+			state.GetState(ValidatorOracleAddress, common.BytesToHash(common.LeftPadBytes(idxInt.Bytes(), 32))).Bytes(),
+		)
+		voteSlot := state.GetState(ValidatorOracleAddress, ValidatorVoteStorageSlot(validator))
+		voteBlock := VoteBlockNumberFromSlot(voteSlot)
+		if voteBlock < threshold {
+			continue
+		}
+		// price is bytes [16:32] of the packed Vote struct.
+		price := new(big.Int).SetBytes(voteSlot[16:32])
+		if price.Sign() == 0 {
+			continue
+		}
+		fresh = append(fresh, price)
+	}
+
+	healthy := uint64(len(fresh))*OracleMinQuorumDenominator >= OracleMinQuorumNumerator*total
+	if len(fresh) == 0 {
+		return new(big.Int), healthy
+	}
+	sort.Slice(fresh, func(i, j int) bool { return fresh[i].Cmp(fresh[j]) < 0 })
+	mid := len(fresh) / 2
+	if len(fresh)%2 == 1 {
+		return new(big.Int).Set(fresh[mid]), healthy
+	}
+	median := new(big.Int).Add(fresh[mid-1], fresh[mid])
+	return median.Rsh(median, 1), healthy
 }
