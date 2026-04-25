@@ -82,6 +82,12 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	if _, err := types.Sender(signer, tx); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidSender, err)
 	}
+	// Paymaster txs must reference an allowlisted paymaster contract.
+	// Defense in depth: state-transition would reject mid-block too,
+	// but cheaper to drop at admission.
+	if pm := tx.Paymaster(); pm != nil && !core.IsAllowedPaymaster(*pm) {
+		return fmt.Errorf("paymaster %s not on chain allowlist", pm.Hex())
+	}
 	// Ensure the transaction has more gas than the bare minimum needed to cover
 	// the transaction metadata
 	intrGas, err := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.To() == nil)
@@ -147,7 +153,12 @@ func ValidateTransactionWithState(tx *types.Transaction, signer types.Signer, op
 			return fmt.Errorf("%w: tx nonce %v, gapped nonce %v", core.ErrNonceTooHigh, tx.Nonce(), gap)
 		}
 	}
-	// Ensure the transactor has enough funds to cover the transaction costs
+	// Ensure the transactor has enough funds to cover the transaction
+	// costs. For paymaster txs, tx.Cost() returns just msg.Value
+	// (the gas fee is settled separately by the paymaster contract);
+	// mempool admission only verifies the value-transfer leg here.
+	// Balance/allowance for the paymaster's chosen asset is verified
+	// at execution time.
 	var (
 		balance = opts.State.GetBalance(from)
 		cost    = tx.Cost()

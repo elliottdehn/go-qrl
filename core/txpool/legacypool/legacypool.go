@@ -600,7 +600,8 @@ func (pool *LegacyPool) validateTxBasics(tx *types.Transaction, local bool) erro
 	opts := &txpool.ValidationOptions{
 		Config: pool.chainconfig,
 		Accept: 0 |
-			1<<types.DynamicFeeTxType,
+			1<<types.DynamicFeeTxType |
+			1<<types.PaymasterDynamicFeeTxType,
 		MaxSize: txMaxSize,
 		MinTip:  pool.gasTip.Load(),
 	}

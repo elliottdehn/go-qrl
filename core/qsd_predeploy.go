@@ -35,12 +35,18 @@ import (
 //     additionally serves as a no-fee CPMM for QRL <-> iQRL swaps
 //     (zero impermanent loss for inverse-priced pairs).
 //
+//   - PayWithIQRL: paymaster that lets transactions settle fees in
+//     iQRL instead of native QRL. Consensus invokes escrow() before
+//     execution and settle() after, transferring iQRL from the payer
+//     to the block coinbase (and refunding any unused fee).
+//
 // The addresses are sequential at the start of the application
 // reserved namespace, well clear of all current precompile slots.
 var (
 	ValidatorOracleAddress = common.BytesToAddress(common.FromHex("0x0000000000000000000000000000000000010000"))
 	InverseQRLAddress      = common.BytesToAddress(common.FromHex("0x0000000000000000000000000000000000010001"))
 	QSDAddress             = common.BytesToAddress(common.FromHex("0x0000000000000000000000000000000000010002"))
+	PayWithIQRLAddress     = common.BytesToAddress(common.FromHex("0x0000000000000000000000000000000000010003"))
 )
 
 // QSDPredeployParams configures the genesis-time deployment of the
@@ -114,6 +120,7 @@ func AddQSDStabilityLayer(alloc GenesisAlloc, params QSDPredeployParams) {
 		ValidatorOracleAddress,
 		InverseQRLAddress,
 		QSDAddress,
+		PayWithIQRLAddress,
 	} {
 		// Foundry's vm.dumpState writes 0x-prefixed lower-case keys;
 		// common.Address.Hex() on this fork returns Q-prefixed, so we

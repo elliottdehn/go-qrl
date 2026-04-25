@@ -40,7 +40,8 @@ var (
 
 // Transaction types.
 const (
-	DynamicFeeTxType = 0x02
+	DynamicFeeTxType          = 0x02
+	PaymasterDynamicFeeTxType = 0x04
 )
 
 // Transaction is a QRL transaction.
@@ -78,6 +79,7 @@ type TxData interface {
 	value() *big.Int
 	nonce() uint64
 	to() *common.Address
+	paymaster() *common.Address
 
 	descriptor() []byte
 	extraParams() []byte
@@ -172,6 +174,8 @@ func (tx *Transaction) decodeTyped(b []byte) (TxData, error) {
 	switch b[0] {
 	case DynamicFeeTxType:
 		inner = new(DynamicFeeTx)
+	case PaymasterDynamicFeeTxType:
+		inner = new(PaymasterDynamicFeeTx)
 	default:
 		return nil, ErrTxTypeNotSupported
 	}
@@ -267,8 +271,24 @@ func (tx *Transaction) To() *common.Address {
 	return copyAddressPtr(tx.inner.to())
 }
 
-// Cost returns (gas * gasPrice) + value.
+// Paymaster returns the address of the paymaster contract that will
+// settle this transaction's fees, or nil if the sender pays directly
+// in native QRL.
+func (tx *Transaction) Paymaster() *common.Address {
+	return copyAddressPtr(tx.inner.paymaster())
+}
+
+// Cost returns the maximum native-QRL outflow this transaction can
+// cause for its sender. For standard txs that's (gas * gasPrice) +
+// value (the EIP-1559 worst case). For paymaster txs the gas fee is
+// settled in some other asset by the paymaster contract, so the
+// only native outflow is the value transfer itself.
+//
+// Used by the txpool for sender-balance and overdraft accounting.
 func (tx *Transaction) Cost() *big.Int {
+	if tx.inner.paymaster() != nil {
+		return new(big.Int).Set(tx.Value())
+	}
 	total := new(big.Int).Mul(tx.GasPrice(), new(big.Int).SetUint64(tx.Gas()))
 	total.Add(total, tx.Value())
 	return total

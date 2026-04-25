@@ -25,6 +25,7 @@ import (
 	cmath "github.com/theQRL/go-qrl/common/math"
 	"github.com/theQRL/go-qrl/core/types"
 	"github.com/theQRL/go-qrl/core/vm"
+	"github.com/theQRL/go-qrl/crypto"
 	"github.com/theQRL/go-qrl/params"
 )
 
@@ -133,6 +134,13 @@ type Message struct {
 	Data       []byte
 	AccessList types.AccessList
 
+	// Paymaster, when non-nil, identifies a paymaster contract that
+	// settles this message's fees on behalf of the sender. The
+	// state-transition engine system-calls Paymaster.escrow() before
+	// execution and Paymaster.settle() after, in lieu of the standard
+	// native-balance debit and tip transfer to the coinbase.
+	Paymaster *common.Address
+
 	// When SkipAccountChecks is true, the message nonce is not checked against the
 	// account nonce in state. It also disables checking that the sender is an EOA.
 	// This field will be set to true for operations like RPC qrl_call.
@@ -151,6 +159,7 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 		Value:             tx.Value(),
 		Data:              tx.Data(),
 		AccessList:        tx.AccessList(),
+		Paymaster:         tx.Paymaster(),
 		SkipAccountChecks: false,
 	}
 	// If baseFee provided, set gasPrice to effectiveGasPrice.
@@ -225,6 +234,30 @@ func (st *StateTransition) to() common.Address {
 func (st *StateTransition) buyGas() error {
 	mgval := new(big.Int).SetUint64(st.msg.GasLimit)
 	mgval = mgval.Mul(mgval, st.msg.GasPrice)
+
+	if err := st.gp.SubGas(st.msg.GasLimit); err != nil {
+		return err
+	}
+	st.gasRemaining += st.msg.GasLimit
+	st.initialGas = st.msg.GasLimit
+
+	// Paymaster path: route the fee debit through the paymaster
+	// contract instead of pulling native QRL from the sender. The
+	// caller still needs the value-transfer balance (msg.Value), but
+	// the gas budget itself is escrowed by the paymaster — typically
+	// in iQRL, though the chain only requires that the paymaster is
+	// an allowlisted contract that implements escrow()/settle().
+	if st.msg.Paymaster != nil {
+		// msg.Value is paid in native QRL even in paymaster txs —
+		// only the gas fee is delegated. So the sender still needs
+		// at least msg.Value of native balance.
+		if have, want := st.state.GetBalance(st.msg.From), st.msg.Value; have.Cmp(want) < 0 {
+			return fmt.Errorf("%w: address %v have %v want %v (value transfer)",
+				ErrInsufficientFunds, st.msg.From.Hex(), have, want)
+		}
+		return st.paymasterEscrow(mgval)
+	}
+
 	balanceCheck := new(big.Int).Set(mgval)
 	if st.msg.GasFeeCap != nil {
 		balanceCheck.SetUint64(st.msg.GasLimit)
@@ -234,12 +267,6 @@ func (st *StateTransition) buyGas() error {
 	if have, want := st.state.GetBalance(st.msg.From), balanceCheck; have.Cmp(want) < 0 {
 		return fmt.Errorf("%w: address %v have %v want %v", ErrInsufficientFunds, st.msg.From.Hex(), have, want)
 	}
-	if err := st.gp.SubGas(st.msg.GasLimit); err != nil {
-		return err
-	}
-	st.gasRemaining += st.msg.GasLimit
-
-	st.initialGas = st.msg.GasLimit
 	st.state.SubBalance(st.msg.From, mgval)
 	return nil
 }
@@ -370,8 +397,36 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 		ret, st.gasRemaining, vmerr = st.qrvm.Call(sender, st.to(), msg.Data, st.gasRemaining, msg.Value)
 	}
 
-	// After EIP-3529: refunds are capped to gasUsed / 5
-	st.refundGas(params.RefundQuotientEIP3529)
+	// After EIP-3529: refunds are capped to gasUsed / 5. Apply the
+	// refund counter to gasRemaining now; the actual return-of-funds
+	// path forks below based on whether a paymaster is in play.
+	st.applyRefundCounter(params.RefundQuotientEIP3529)
+
+	if msg.Paymaster != nil {
+		// Paymaster path: settle via the paymaster contract instead
+		// of native refund + native coinbase tip. The paymaster
+		// holds maxFee in escrow; settle directs actualFee to
+		// coinbase and refunds the rest to the sender.
+		maxFee := new(big.Int).Mul(new(big.Int).SetUint64(st.initialGas), msg.GasPrice)
+		actualFee := new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), msg.GasPrice)
+		if err := st.paymasterSettle(maxFee, actualFee); err != nil {
+			// Settle should be infallible — escrow guarantees the
+			// contract holds maxFee. If we land here it's a chain
+			// invariant violation.
+			return nil, fmt.Errorf("paymaster settle (post-exec): %w", err)
+		}
+		// Return remaining gas to the block gas counter so it is
+		// available for the next transaction.
+		st.gp.AddGas(st.gasRemaining)
+		return &ExecutionResult{
+			UsedGas:    st.gasUsed(),
+			Err:        vmerr,
+			ReturnData: ret,
+		}, nil
+	}
+
+	// Native path: refund unused gas to sender + tip the coinbase.
+	st.refundNativeGas()
 	effectiveTip := cmath.BigMin(msg.GasTipCap, new(big.Int).Sub(msg.GasFeeCap, st.qrvm.Context.BaseFee))
 
 	if st.qrvm.Config.NoBaseFee && msg.GasFeeCap.Sign() == 0 && msg.GasTipCap.Sign() == 0 {
@@ -391,21 +446,137 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	}, nil
 }
 
-func (st *StateTransition) refundGas(refundQuotient uint64) {
-	// Apply refund counter, capped to a refund quotient
+// applyRefundCounter folds the EVM-accumulated refund counter
+// (SSTORE refunds, capped at gasUsed/refundQuotient by EIP-3529)
+// into gasRemaining. Split out from refundNativeGas because the
+// paymaster path also needs the counter applied — settlement uses
+// gasUsed = initialGas - gasRemaining, so under-applying the
+// refund would over-bill the user.
+func (st *StateTransition) applyRefundCounter(refundQuotient uint64) {
 	refund := min(st.gasUsed()/refundQuotient, st.state.GetRefund())
 	st.gasRemaining += refund
+}
 
-	// Return QRL for remaining gas, exchanged at the original rate.
+// refundNativeGas returns unused gas to the sender's native QRL
+// balance. Only used on the non-paymaster path; paymaster txs settle
+// via the paymaster contract instead.
+func (st *StateTransition) refundNativeGas() {
 	remaining := new(big.Int).Mul(new(big.Int).SetUint64(st.gasRemaining), st.msg.GasPrice)
 	st.state.AddBalance(st.msg.From, remaining)
-
-	// Also return remaining gas to the block gas counter so it is
-	// available for the next transaction.
 	st.gp.AddGas(st.gasRemaining)
 }
 
 // gasUsed returns the amount of gas used up by the state transition.
 func (st *StateTransition) gasUsed() uint64 {
 	return st.initialGas - st.gasRemaining
+}
+
+// ----------------------------------------------------------------------------
+// Paymaster system calls.
+//
+// When a transaction designates a Paymaster, the standard buyGas /
+// refundGas / coinbase-tip flow is replaced with two QRVM calls:
+//
+//   1. paymasterEscrow() before execution — invokes
+//      paymaster.escrow(sender, maxFee). The paymaster contract
+//      pulls maxFee of whatever asset it accepts (typically iQRL)
+//      from the sender into its own balance.
+//
+//   2. paymasterSettle() after execution — invokes
+//      paymaster.settle(sender, maxFee, actualFee). The paymaster
+//      forwards actualFee to block.coinbase and refunds any unused
+//      portion to the sender.
+//
+// Both calls are issued from a fixed sentinel sender address (the
+// "system caller") so the paymaster contract can verify that it is
+// being driven by consensus rather than a user-issued tx. They use a
+// generous fixed gas budget that does not draw from the tx's gas
+// pool.
+//
+// Allowlist: only a curated set of paymasters is accepted. The chain
+// hard-codes core.PayWithIQRLAddress as the only supported paymaster
+// at this time; pre-execution rejection of unknown paymasters is the
+// txpool's job (see TxPool admission), but state-transition validates
+// here too to defend against block-builder bugs.
+// ----------------------------------------------------------------------------
+
+// SystemCallerAddress is the sentinel sender used for system calls
+// to predeployed contracts (paymaster escrow/settle, beacon-root
+// updates if added later, etc.). Mirrors the convention used by
+// EIP-4788 and is hard-coded inside PayWithIQRL.
+var SystemCallerAddress = common.BytesToAddress(common.FromHex("0xfffffffffffffffffffffffffffffffffffffffe"))
+
+// PaymasterSystemGasLimit is the gas budget allocated to each
+// paymaster system call. Generous enough for an ERC-20 transferFrom
+// + a couple of refund transfers, but bounded so a buggy paymaster
+// can't burn unbounded gas.
+const PaymasterSystemGasLimit uint64 = 1_000_000
+
+var (
+	// keccak256("escrow(address,uint256)")[:4]
+	paymasterEscrowSelector = crypto.Keccak256([]byte("escrow(address,uint256)"))[:4]
+	// keccak256("settle(address,uint256,uint256)")[:4]
+	paymasterSettleSelector = crypto.Keccak256([]byte("settle(address,uint256,uint256)"))[:4]
+)
+
+// IsAllowedPaymaster reports whether the given address is on the
+// chain's paymaster allowlist. Currently a single-entry list; future
+// paymasters (e.g. one that accepts QSD) would extend this.
+func IsAllowedPaymaster(addr common.Address) bool {
+	return addr == PayWithIQRLAddress
+}
+
+// paymasterEscrow invokes paymaster.escrow(sender, maxFee). Called
+// from buyGas() in lieu of the native-balance debit when the message
+// designates a paymaster.
+func (st *StateTransition) paymasterEscrow(maxFee *big.Int) error {
+	if !IsAllowedPaymaster(*st.msg.Paymaster) {
+		return fmt.Errorf("paymaster %s not on chain allowlist", st.msg.Paymaster.Hex())
+	}
+	calldata := encodeAddressUint256(paymasterEscrowSelector, st.msg.From, maxFee)
+	if err := st.systemCall(*st.msg.Paymaster, calldata); err != nil {
+		return fmt.Errorf("paymaster escrow: %w", err)
+	}
+	return nil
+}
+
+// paymasterSettle invokes paymaster.settle(sender, maxFee, actualFee).
+// Called from TransitionDb after execution when the message designated
+// a paymaster.
+func (st *StateTransition) paymasterSettle(maxFee, actualFee *big.Int) error {
+	calldata := encodeAddressUint256Uint256(paymasterSettleSelector, st.msg.From, maxFee, actualFee)
+	if err := st.systemCall(*st.msg.Paymaster, calldata); err != nil {
+		return fmt.Errorf("paymaster settle: %w", err)
+	}
+	return nil
+}
+
+// systemCall issues a synthetic call from SystemCallerAddress to
+// `to` with the given calldata, using PaymasterSystemGasLimit out of
+// band (no draw from the tx gas pool). Returns an error if the call
+// reverted.
+func (st *StateTransition) systemCall(to common.Address, calldata []byte) error {
+	sender := vm.AccountRef(SystemCallerAddress)
+	_, _, vmerr := st.qrvm.Call(sender, to, calldata, PaymasterSystemGasLimit, common.Big0)
+	return vmerr
+}
+
+// encodeAddressUint256 builds calldata for `f(address, uint256)`:
+// 4-byte selector || 32-byte address (left-padded) || 32-byte uint256.
+func encodeAddressUint256(selector []byte, addr common.Address, n *big.Int) []byte {
+	out := make([]byte, 0, 4+32+32)
+	out = append(out, selector...)
+	var padded common.Hash
+	copy(padded[12:], addr.Bytes())
+	out = append(out, padded.Bytes()...)
+	out = append(out, common.LeftPadBytes(n.Bytes(), 32)...)
+	return out
+}
+
+// encodeAddressUint256Uint256 builds calldata for `f(address, uint256, uint256)`:
+// 4-byte selector || 32-byte address || 32-byte n || 32-byte m.
+func encodeAddressUint256Uint256(selector []byte, addr common.Address, n, m *big.Int) []byte {
+	out := encodeAddressUint256(selector, addr, n)
+	out = append(out, common.LeftPadBytes(m.Bytes(), 32)...)
+	return out
 }

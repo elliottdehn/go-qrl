@@ -19,6 +19,7 @@ func TestQSDAddressesDistinctAndNonZero(t *testing.T) {
 		ValidatorOracleAddress,
 		InverseQRLAddress,
 		QSDAddress,
+		PayWithIQRLAddress,
 	}
 	seen := make(map[common.Address]bool, len(addrs))
 	for _, a := range addrs {
@@ -49,20 +50,21 @@ func TestQSDAddressesDistinctAndNonZero(t *testing.T) {
 	}
 }
 
-// TestAddQSDStabilityLayerInjectsThreeEntries verifies the helper
-// adds exactly the three reserved addresses to a GenesisAlloc.
-func TestAddQSDStabilityLayerInjectsThreeEntries(t *testing.T) {
+// TestAddQSDStabilityLayerInjectsAllReservedEntries verifies the
+// helper adds exactly the four reserved addresses to a GenesisAlloc.
+func TestAddQSDStabilityLayerInjectsAllReservedEntries(t *testing.T) {
 	alloc := GenesisAlloc{}
 	owner := common.BytesToAddress(common.FromHex("0xc0ffee0000000000000000000000000000000000"))
 	AddQSDStabilityLayer(alloc, DefaultQSDPredeployParams(owner))
 
-	if len(alloc) != 3 {
-		t.Fatalf("expected 3 entries, got %d", len(alloc))
+	if len(alloc) != 4 {
+		t.Fatalf("expected 4 entries, got %d", len(alloc))
 	}
 	for _, want := range []common.Address{
 		ValidatorOracleAddress,
 		InverseQRLAddress,
 		QSDAddress,
+		PayWithIQRLAddress,
 	} {
 		if _, ok := alloc[want]; !ok {
 			t.Fatalf("missing reserved address %s", want.Hex())
@@ -80,6 +82,7 @@ func TestDeveloperGenesisIncludesQSDAddresses(t *testing.T) {
 		ValidatorOracleAddress,
 		InverseQRLAddress,
 		QSDAddress,
+		PayWithIQRLAddress,
 	} {
 		if _, ok := g.Alloc[want]; !ok {
 			t.Fatalf("dev genesis missing %s", want.Hex())
@@ -100,15 +103,16 @@ func TestPredeployBytecodeIsNonEmpty(t *testing.T) {
 		ValidatorOracleAddress,
 		InverseQRLAddress,
 		QSDAddress,
+		PayWithIQRLAddress,
 	} {
 		acct := alloc[addr]
 		if len(acct.Code) == 0 {
 			t.Errorf("%s: empty code", addr.Hex())
 		}
-		// Sanity floor: the smallest of the three (ValidatorOracle)
-		// compiles to ~3.7 KB. Anything below 1 KB indicates a stub
-		// or truncated dump.
-		if len(acct.Code) < 1024 {
+		// Sanity floor: the smallest of the four (PayWithIQRL)
+		// compiles to ~1.2 KB. Anything below 512 bytes indicates a
+		// stub or truncated dump.
+		if len(acct.Code) < 512 {
 			t.Errorf("%s: code suspiciously short (%d bytes)", addr.Hex(), len(acct.Code))
 		}
 	}

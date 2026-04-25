@@ -258,6 +258,23 @@ func (s ZondSigner) Hash(tx *Transaction, descriptor []byte, extraParams []byte)
 				descriptor,
 				extraParams,
 			})
+	case PaymasterDynamicFeeTxType:
+		return prefixedRlpHash(
+			tx.Type(),
+			[]any{
+				s.ChainId,
+				tx.Nonce(),
+				tx.GasTipCap(),
+				tx.GasFeeCap(),
+				tx.Gas(),
+				tx.To(),
+				tx.Value(),
+				tx.Data(),
+				tx.AccessList(),
+				tx.Paymaster(),
+				descriptor,
+				extraParams,
+			})
 	default:
 		// This _should_ not happen, but in case someone sends in a bad
 		// json struct via RPC, it's probably more prudent to return an
