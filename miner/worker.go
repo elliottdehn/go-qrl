@@ -325,6 +325,16 @@ func (miner *Miner) fillTransactions(interrupt *atomic.Int32, env *environment) 
 			return err
 		}
 	}
+	// Proposer-vote rule: if our coinbase is a registered validator,
+	// the block we propose MUST include our own submitVote tx
+	// targeting this block's number. ValidateBody on every peer
+	// enforces this; producing an invalid block would just get it
+	// rejected. Fail fast here — before we waste cycles on the
+	// non-vote tx pool — so the operator sees a clear error and the
+	// scheduler retries on the next slot once qsdfeeder catches up.
+	if err := ensureProposerVote(env); err != nil {
+		return err
+	}
 	// Then everything else.
 	if len(localOther) > 0 {
 		txs := newTransactionsByPriceAndNonce(env.signer, localOther, env.header.BaseFee)
@@ -383,6 +393,28 @@ func partitionVoteTxs(in map[common.Address][]*txpool.LazyTransaction) (votes, o
 		}
 	}
 	return votes, other
+}
+
+// ensureProposerVote returns nil unless we are the proposer (env.coinbase)
+// AND we are a registered validator going into this block AND no
+// submitVote-from-coinbase-targeting-env.header.Number has yet been
+// committed into env.txs. In that case it returns an error so the
+// caller aborts block assembly rather than producing a body that
+// peers will reject under core.validateProposerVote.
+//
+// State note: env.state at fillTransactions time still reflects the
+// parent state's ValidatorOracle.validatorIndex slot, because the
+// miner does not run setValidatorSet (that system call is applied
+// during block PROCESSING, not block BUILDING). Submitted votes
+// only mutate validators[v].votes, not validatorIndex, so reading
+// validatorIndex against env.state — even after the votes phase —
+// matches what the block validator sees against parent state.
+func ensureProposerVote(env *environment) error {
+	if env.state.GetState(core.ValidatorOracleAddress, core.ValidatorIndexStorageSlot(env.coinbase)) == (common.Hash{}) {
+		return nil
+	}
+	isValidator := func(addr common.Address) bool { return addr == env.coinbase }
+	return core.ValidateProposerVote(env.coinbase, env.header.Number.Uint64(), env.txs, env.signer, isValidator)
 }
 
 // totalFees computes total consumed miner fees in Planck. Block transactions and receipts have to have the same order.

@@ -189,3 +189,95 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+func proposerAddress(w wallet.Wallet) common.Address {
+	a := w.GetAddress()
+	return common.BytesToAddress(a[:])
+}
+
+func TestValidateProposerVote_NotAValidator_OK(t *testing.T) {
+	w := voteTestWallet(t)
+	signer := types.LatestSignerForChainID(params.TestChainConfig.ChainID)
+	txs := []*types.Transaction{signTransfer(t, w, 0)}
+	isValidator := func(_ common.Address) bool { return false }
+	if err := ValidateProposerVote(proposerAddress(w), 7, txs, signer, isValidator); err != nil {
+		t.Errorf("non-validator proposer should be skipped, got %v", err)
+	}
+}
+
+func TestValidateProposerVote_ValidatorWithVote_OK(t *testing.T) {
+	w := voteTestWallet(t)
+	proposer := proposerAddress(w)
+	signer := types.LatestSignerForChainID(params.TestChainConfig.ChainID)
+	txs := []*types.Transaction{
+		signSubmitVote(t, w, 0, big.NewInt(7), big.NewInt(1_000_000_000_000_000_000)),
+		signTransfer(t, w, 1),
+	}
+	isValidator := func(addr common.Address) bool { return addr == proposer }
+	if err := ValidateProposerVote(proposer, 7, txs, signer, isValidator); err != nil {
+		t.Errorf("registered proposer with proper vote should pass, got %v", err)
+	}
+}
+
+func TestValidateProposerVote_ValidatorWithoutVote_Rejected(t *testing.T) {
+	w := voteTestWallet(t)
+	proposer := proposerAddress(w)
+	signer := types.LatestSignerForChainID(params.TestChainConfig.ChainID)
+	txs := []*types.Transaction{
+		signTransfer(t, w, 0),
+		signTransfer(t, w, 1),
+	}
+	isValidator := func(addr common.Address) bool { return addr == proposer }
+	err := ValidateProposerVote(proposer, 7, txs, signer, isValidator)
+	if err == nil {
+		t.Fatal("expected error: registered proposer must include their own submitVote")
+	}
+	if !contains(err.Error(), "proposer vote") {
+		t.Errorf("error %q does not mention proposer vote", err.Error())
+	}
+}
+
+func TestValidateProposerVote_ValidatorWithStaleTargetVote_Rejected(t *testing.T) {
+	w := voteTestWallet(t)
+	proposer := proposerAddress(w)
+	signer := types.LatestSignerForChainID(params.TestChainConfig.ChainID)
+	// Vote targets block 6 but the block is at height 7 — the vote
+	// would also revert at the contract level (forBlockNumber !=
+	// block.number) but the validator catches it before execution.
+	txs := []*types.Transaction{
+		signSubmitVote(t, w, 0, big.NewInt(6), big.NewInt(1_000_000_000_000_000_000)),
+	}
+	isValidator := func(addr common.Address) bool { return addr == proposer }
+	err := ValidateProposerVote(proposer, 7, txs, signer, isValidator)
+	if err == nil {
+		t.Fatal("expected error: vote targets the wrong block number")
+	}
+}
+
+// TestValidateProposerVote_ValidatorOtherSenderVote_Rejected: a vote
+// from some OTHER validator doesn't count as the proposer's own
+// vote, even if it's correctly targeted at this block. The proposer
+// rule is about who SIGNED the submitVote, not just who was
+// included.
+func TestValidateProposerVote_ValidatorOtherSenderVote_Rejected(t *testing.T) {
+	w := voteTestWallet(t)
+	proposer := proposerAddress(w)
+	signer := types.LatestSignerForChainID(params.TestChainConfig.ChainID)
+
+	// A second wallet to play "some other validator". Use a
+	// different deterministic seed so its address differs from `w`.
+	other, err := wallet.RestoreFromSeedHex(
+		"010000777777777777777777777777777777777777777777777777777777777777777700000000000000000000000000000000",
+	)
+	if err != nil {
+		t.Fatalf("restore other wallet: %v", err)
+	}
+	txs := []*types.Transaction{
+		// Vote from `other`, correctly targeted at block 7.
+		signSubmitVote(t, other, 0, big.NewInt(7), big.NewInt(1_000_000_000_000_000_000)),
+	}
+	isValidator := func(addr common.Address) bool { return addr == proposer }
+	if err := ValidateProposerVote(proposer, 7, txs, signer, isValidator); err == nil {
+		t.Fatal("expected error: only the proposer's own submitVote satisfies the rule")
+	}
+}
