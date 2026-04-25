@@ -13,11 +13,19 @@ Two submission modes:
 
   - **Keyed** — when `--keystore` is set, the daemon decrypts the wallet,
     dials the RPC endpoint, builds an EIP-1559 transaction calling
-    `submitVote(uint256)` on the oracle, signs with the wallet's
+    `submitVote(uint256,uint256)` on the oracle, signs with the wallet's
     post-quantum key, and broadcasts via `qrl_sendRawTransaction`.
   - **Stub** — when `--keystore` is empty, the daemon only logs what it
     would have submitted. Useful for smoke-testing price discovery on
     a dev network without provisioning a validator key.
+
+The chain treats the daemon's vote tx as **free** when (a) the sender
+is in the oracle's validator set, (b) the calldata is a `submitVote`
+call, and (c) the validator hasn't already voted in the block being
+mined. Validators do still need a small native-QRL balance to cover
+the buyGas pre-charge — it gets refunded in full at settlement, so
+the steady-state cost is zero, but there has to be something to
+debit from. A few QRL is plenty.
 
 
 # Build
@@ -107,7 +115,9 @@ Vote calldata is the standard 4+32+32 layout:
 The contract enforces `forBlockNumber == block.number` strictly: a
 tx that mines in any other block reverts. This eliminates the
 stale-vote-overwrites-fresh-vote race that affects late-mining
-mempool txs in the no-target design.
+mempool txs in the no-target design. The legacy txpool also evicts
+votes whose target block has already been produced, so a missed
+slot doesn't leave a doomed tx propagating across the network.
 
 The selector is computed from
 `keccak256("submitVote(uint256,uint256)")[:4]` at init and verified
@@ -120,6 +130,15 @@ against the Solidity ABI in tests.
 go test ./cmd/qsdfeeder/...
 ```
 
-Covers price-string parsing, static-source immutability, and
-calldata encoding (selector + uint256 layout, plus rejection of
-zero / negative / nil inputs).
+Covers price-string parsing, static-source immutability, calldata
+encoding (selector + dual-uint256 layout, rejection of zero /
+negative / nil inputs), and the keyed submitter's RPC-driven
+build path against a fake `qrlclient` (nonce, base-fee + tip,
+gas estimation, signing, broadcast — including error propagation
+for each step).
+
+Free-vote and paymaster integration tests live in
+`core/free_vote_integration_test.go` and
+`core/paymaster_integration_test.go`; they exercise the full
+state-transition path against a live in-memory state with the
+predeploys loaded.
