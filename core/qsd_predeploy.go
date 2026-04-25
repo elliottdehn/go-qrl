@@ -13,6 +13,32 @@ import (
 	"strings"
 
 	"github.com/theQRL/go-qrl/common"
+	"github.com/theQRL/go-qrl/crypto"
+)
+
+// SubmitVoteSelector is the 4-byte function selector for
+//
+//	submitVote(uint256,uint256)
+//
+// invoked on ValidatorOracle. Computed once at init; verified
+// against `cast sig` in tests.
+var SubmitVoteSelector = crypto.Keccak256([]byte("submitVote(uint256,uint256)"))[:4]
+
+// ValidatorOracle storage layout (from src/ValidatorOracle.sol):
+//
+//   - slot 0: Ownable._owner
+//   - immutables (voteStalenessBlocks, minQuorum*) live in bytecode
+//   - slot 1: validators[] length
+//   - slot 2: validatorIndex[address] mapping
+//   - slot 3: votes[address] mapping (struct Vote { uint128 price; uint64 blockNumber; })
+//   - slot 4: cache (packed ViewCache)
+//
+// These slot constants drive the consensus-side read-paths used to
+// gate the free-validator-vote rule.
+const (
+	validatorOracleValidatorsLengthSlot = 1
+	validatorOracleValidatorIndexSlot   = 2
+	validatorOracleVotesSlot            = 3
 )
 
 // QSD Stability Layer: addresses reserved for the on-chain primitives
@@ -207,4 +233,47 @@ func overrideOracleOwner(alloc GenesisAlloc, owner common.Address) {
 // applied" from "the dump was never loaded".
 func PredeploySentinelOwner() common.Address {
 	return predeploySentinelOwner
+}
+
+// ValidatorIndexStorageSlot returns the storage slot in
+// ValidatorOracle that holds validatorIndex[validator]. The mapping
+// reserves slot 2; entries live at keccak256(validator || slot 2).
+// Non-zero means the address is a registered validator (1-indexed).
+func ValidatorIndexStorageSlot(validator common.Address) common.Hash {
+	return mappingSlot(validator.Bytes(), validatorOracleValidatorIndexSlot)
+}
+
+// ValidatorVoteStorageSlot returns the storage slot in
+// ValidatorOracle that holds votes[validator]. The struct packs
+// (uint128 price, uint64 blockNumber) into a single slot:
+//
+//	bytes [16:32] = price       (16 bytes)
+//	bytes  [8:16] = blockNumber ( 8 bytes)
+//	bytes  [0:8]  = padding     ( 8 bytes)
+func ValidatorVoteStorageSlot(validator common.Address) common.Hash {
+	return mappingSlot(validator.Bytes(), validatorOracleVotesSlot)
+}
+
+// VoteBlockNumberFromSlot extracts the blockNumber field from a
+// votes[] mapping slot value, packed per the layout documented on
+// ValidatorVoteStorageSlot.
+func VoteBlockNumberFromSlot(slot common.Hash) uint64 {
+	var n uint64
+	for i := 0; i < 8; i++ {
+		n = (n << 8) | uint64(slot[8+i])
+	}
+	return n
+}
+
+// mappingSlot computes the storage slot of mapping[key], where the
+// mapping is declared at the given top-level slot. Uses the standard
+// Solidity layout: keccak256(leftPad(key, 32) || leftPad(slot, 32)).
+func mappingSlot(key []byte, slot uint64) common.Hash {
+	keyPadded := make([]byte, 32)
+	copy(keyPadded[32-len(key):], key)
+	slotPadded := make([]byte, 32)
+	for i := 0; i < 8; i++ {
+		slotPadded[31-i] = byte(slot >> (8 * i))
+	}
+	return crypto.Keccak256Hash(keyPadded, slotPadded)
 }

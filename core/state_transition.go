@@ -17,6 +17,7 @@
 package core
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"math/big"
@@ -385,6 +386,12 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	// - prepare accessList
 	st.state.Prepare(rules, msg.From, st.qrvm.Context.Coinbase, msg.To, vm.ActivePrecompiles(rules), msg.AccessList)
 
+	// Snapshot the free-vote eligibility BEFORE execution: the
+	// votes[from].blockNumber slot will be overwritten by a
+	// successful submitVote(), so any post-execution read would
+	// always show "already voted this block" and grant nothing free.
+	freeVoteCandidate := st.isFreeValidatorVoteTx()
+
 	var (
 		ret   []byte
 		vmerr error // vm errors do not effect consensus and are therefore not assigned to err
@@ -425,6 +432,23 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 		}, nil
 	}
 
+	// Free-validator-vote path: a successful submitVote() to the
+	// ValidatorOracle from a registered validator who hasn't yet
+	// voted in this block costs the validator zero — the entire
+	// pre-charged buyGas debit is refunded and no tip is paid. The
+	// candidate flag was captured pre-execution; we only honour it
+	// if the EVM call also succeeded (no revert).
+	if vmerr == nil && freeVoteCandidate {
+		full := new(big.Int).Mul(new(big.Int).SetUint64(st.initialGas), msg.GasPrice)
+		st.state.AddBalance(msg.From, full)
+		st.gp.AddGas(st.gasRemaining)
+		return &ExecutionResult{
+			UsedGas:    st.gasUsed(),
+			Err:        vmerr,
+			ReturnData: ret,
+		}, nil
+	}
+
 	// Native path: refund unused gas to sender + tip the coinbase.
 	st.refundNativeGas()
 	effectiveTip := cmath.BigMin(msg.GasTipCap, new(big.Int).Sub(msg.GasFeeCap, st.qrvm.Context.BaseFee))
@@ -444,6 +468,42 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 		Err:        vmerr,
 		ReturnData: ret,
 	}, nil
+}
+
+// isFreeValidatorVoteTx reports whether the current message qualifies
+// for free-tx treatment under the validator-vote rule. The four
+// conditions, evaluated against the current chain state:
+//
+//  1. Not a paymaster tx (paymaster path takes precedence).
+//  2. Target is the ValidatorOracle predeploy.
+//  3. Calldata begins with the submitVote(uint256,uint256) selector.
+//  4. Sender is a registered validator (validatorIndex non-zero) AND
+//     has not already voted in the current block.
+//
+// The caller must additionally verify that the EVM execution itself
+// did not revert before granting free status; a reverted submitVote
+// (e.g. wrong forBlockNumber) pays normal gas as anti-spam.
+func (st *StateTransition) isFreeValidatorVoteTx() bool {
+	msg := st.msg
+	if msg.Paymaster != nil {
+		return false
+	}
+	if msg.To == nil || *msg.To != ValidatorOracleAddress {
+		return false
+	}
+	if len(msg.Data) < 4 || !bytes.Equal(msg.Data[:4], SubmitVoteSelector) {
+		return false
+	}
+	idxSlot := ValidatorIndexStorageSlot(msg.From)
+	if st.state.GetState(ValidatorOracleAddress, idxSlot).Big().Sign() == 0 {
+		return false
+	}
+	voteSlot := ValidatorVoteStorageSlot(msg.From)
+	prevBlock := VoteBlockNumberFromSlot(st.state.GetState(ValidatorOracleAddress, voteSlot))
+	if prevBlock == st.qrvm.Context.BlockNumber.Uint64() {
+		return false
+	}
+	return true
 }
 
 // applyRefundCounter folds the EVM-accumulated refund counter
