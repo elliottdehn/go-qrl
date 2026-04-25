@@ -206,11 +206,7 @@ practical first-tx flow for any user:
      `Paymaster = 0x...010003` and the gas cost flows through iQRL.
 
 A clean wallet UX bundles steps 2 and 3 into the user's onboarding
-flow so it feels like one interaction. There is no equivalent of
-EIP-2612 `permit()` available on this chain (the OZ implementation
-uses ECRECOVER which isn't accessible here); a future change may
-add an ML-DSA-87-based delegated approval primitive to remove
-step 3.
+flow so it feels like one interaction.
 
 ## 8. Troubleshooting
 
@@ -228,8 +224,7 @@ step 3.
 These known gaps are tracked in
 [`qsd-stability-layer.md`](qsd-stability-layer.md) §"Open work":
 
-  - ML-DSA-87 permit primitive (removes step 3 above).
-  - Block-builder fairness for paymaster txs against the QRL gas
-    market (basic ordering shipped; richer auction work is open).
+  - Richer paymaster auction (basic USD-comparable ordering shipped;
+    fuller priority-fee semantics are open work).
   - Wallet/SDK support for constructing type-0x04 txs (the chain
     accepts them; client tooling is incomplete).

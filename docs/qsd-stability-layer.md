@@ -14,7 +14,7 @@ QRL grant proposal.
 |---|---------------------|------------------------------------------------|------|
 | 1 | `ValidatorOracle`   | `0x0000000000000000000000000000000000010000`   | Per-block median QRL/USD price from validator votes. |
 | 2 | `InverseQRL` (iQRL) | `0x0000000000000000000000000000000000010001`   | ERC-20 whose canonical USD value tracks `1 / p`. Minted by burning native QRL. |
-| 3 | `QSD`               | `0x0000000000000000000000000000000000010002`   | Dollar stablecoin. ERC-20 + EIP-2612. Backed by a symmetric (QRL, iQRL) pool. |
+| 3 | `QSD`               | `0x0000000000000000000000000000000000010002`   | Dollar stablecoin. ERC-20. Backed by a symmetric (QRL, iQRL) pool. |
 | 4 | `PayWithIQRL`       | `0x0000000000000000000000000000000000010003`   | Paymaster. Lets a tx settle gas in iQRL: escrow before exec, settle (forward to coinbase + refund unused) after. |
 
 Addresses are sequential at the start of the application-reserved
@@ -165,15 +165,6 @@ depends on later ones.
 
 ## Open work
 
-  - **ML-DSA-87 permit primitive.** OZ `ERC20Permit` uses
-    ECRECOVER (precompile `0x01`), which on this chain is replaced
-    with `DepositRoot`. So `iqrl.permit()` doesn't work as
-    inherited. Either reimplement `Permit` against an ML-DSA-87
-    recovery precompile (does one exist?) or design a chain-native
-    delegated-approval primitive. Practical impact today: a new
-    user's *first* paymaster tx requires a one-time
-    `iqrl.approve()` call paid in native QRL — see the deployment
-    runbook §7.
   - **Wallet / SDK support** for constructing type-0x04 txs. The
     chain accepts them via `eth_sendRawTransaction` and the JSON
     wire format is documented; client-side tooling that builds and
