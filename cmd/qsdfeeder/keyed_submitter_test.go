@@ -105,7 +105,7 @@ func TestKeyedSubmitter_HappyPath(t *testing.T) {
 	s := newTestSubmitter(t, rpc)
 	price := bigStr("1500000000000000000")
 
-	if err := s.SubmitVote(context.Background(), price); err != nil {
+	if err := s.SubmitVote(context.Background(), big.NewInt(1234), price); err != nil {
 		t.Fatalf("SubmitVote: %v", err)
 	}
 	if rpc.sentTx == nil {
@@ -134,7 +134,7 @@ func TestKeyedSubmitter_HappyPath(t *testing.T) {
 		t.Errorf("gas: got %d, want 60000", tx.Gas())
 	}
 	// Calldata is exactly what EncodeSubmitVoteCalldata produced.
-	wantData, _ := EncodeSubmitVoteCalldata(price)
+	wantData, _ := EncodeSubmitVoteCalldata(big.NewInt(1234), price)
 	if string(tx.Data()) != string(wantData) {
 		t.Errorf("calldata: got %x, want %x", tx.Data(), wantData)
 	}
@@ -154,7 +154,7 @@ func TestKeyedSubmitter_RejectsBadPrice(t *testing.T) {
 	s := newTestSubmitter(t, rpc)
 
 	for _, p := range []*big.Int{nil, big.NewInt(0), big.NewInt(-1)} {
-		if err := s.SubmitVote(context.Background(), p); err == nil {
+		if err := s.SubmitVote(context.Background(), big.NewInt(1), p); err == nil {
 			t.Errorf("expected error for price=%v", p)
 		}
 	}
@@ -186,7 +186,7 @@ func TestKeyedSubmitter_PropagatesRPCErrors(t *testing.T) {
 			}
 			c.setup(rpc)
 			s := newTestSubmitter(t, rpc)
-			err := s.SubmitVote(context.Background(), bigStr("1000000000000000000"))
+			err := s.SubmitVote(context.Background(), big.NewInt(1), bigStr("1000000000000000000"))
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -205,7 +205,7 @@ func TestKeyedSubmitter_RejectsPreLondonChain(t *testing.T) {
 		gasEstimate: 21000,
 	}
 	s := newTestSubmitter(t, rpc)
-	err := s.SubmitVote(context.Background(), bigStr("1000000000000000000"))
+	err := s.SubmitVote(context.Background(), big.NewInt(1), bigStr("1000000000000000000"))
 	if err == nil || !contains(err.Error(), "EIP-1559") {
 		t.Errorf("expected EIP-1559 error, got %v", err)
 	}

@@ -46,6 +46,7 @@ type config struct {
 	rpcURL       string
 	oracleAddr   string
 	interval     time.Duration
+	targetOffset uint64
 	priceSource  string
 	staticPrice  string
 	chainID      int64
@@ -62,7 +63,9 @@ func parseFlags() *config {
 		core.ValidatorOracleAddress.Hex(),
 		"ValidatorOracle contract address (default: reserved address)")
 	flag.DurationVar(&c.interval, "interval", 30*time.Second,
-		"vote-submission cadence")
+		"vote-submission cadence (wall-clock); each tick targets head + --target-offset")
+	flag.Uint64Var(&c.targetOffset, "target-offset", 1,
+		"submit votes targeted at chain-head + this many blocks; 1 means \"the next block\"")
 	flag.StringVar(&c.priceSource, "price-source", "static",
 		"price source: static (only one implemented for now)")
 	flag.StringVar(&c.staticPrice, "static-price", "1.00",
@@ -78,35 +81,43 @@ func parseFlags() *config {
 	return c
 }
 
+// rpcBlockSource adapts a *qrlclient.Client into a BlockNumberSource.
+type rpcBlockSource struct{ c *qrlclient.Client }
+
+func (r rpcBlockSource) BlockNumber(ctx context.Context) (uint64, error) {
+	return r.c.BlockNumber(ctx)
+}
+
 // loadKeyedSubmitter handles the keystore-backed submission path:
 // decrypt the wallet, dial the RPC, resolve the chain ID, and return
-// a fully-wired VoteSubmitter. The returned closeFn must be called by
-// the caller on shutdown to release the RPC connection.
+// a fully-wired VoteSubmitter + BlockNumberSource backed by the same
+// RPC connection. The returned closeFn must be called by the caller
+// on shutdown to release that connection.
 func loadKeyedSubmitter(
 	ctx context.Context,
 	c *config,
 	oracle common.Address,
 	logf func(format string, args ...any),
-) (VoteSubmitter, func(), error) {
+) (VoteSubmitter, BlockNumberSource, func(), error) {
 	if c.passwordFile == "" {
-		return nil, nil, fmt.Errorf("--password-file is required when --keystore is set")
+		return nil, nil, nil, fmt.Errorf("--password-file is required when --keystore is set")
 	}
 	keyJSON, err := os.ReadFile(c.keystorePath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read keystore: %w", err)
+		return nil, nil, nil, fmt.Errorf("read keystore: %w", err)
 	}
 	password, err := os.ReadFile(c.passwordFile)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read password file: %w", err)
+		return nil, nil, nil, fmt.Errorf("read password file: %w", err)
 	}
 	key, err := keystore.DecryptKey(keyJSON, strings.TrimRight(string(password), "\r\n"))
 	if err != nil {
-		return nil, nil, fmt.Errorf("decrypt keystore: %w", err)
+		return nil, nil, nil, fmt.Errorf("decrypt keystore: %w", err)
 	}
 
 	client, err := qrlclient.DialContext(ctx, c.rpcURL)
 	if err != nil {
-		return nil, nil, fmt.Errorf("dial rpc: %w", err)
+		return nil, nil, nil, fmt.Errorf("dial rpc: %w", err)
 	}
 
 	chainID := big.NewInt(c.chainID)
@@ -114,7 +125,7 @@ func loadKeyedSubmitter(
 		chainID, err = client.ChainID(ctx)
 		if err != nil {
 			client.Close()
-			return nil, nil, fmt.Errorf("auto-detect chain id: %w", err)
+			return nil, nil, nil, fmt.Errorf("auto-detect chain id: %w", err)
 		}
 	}
 	logf("loaded validator key: address=%s chain_id=%s", key.Address.Hex(), chainID.String())
@@ -122,9 +133,9 @@ func loadKeyedSubmitter(
 	sub, err := NewKeyedSubmitter(client, key.Wallet, chainID, oracle, logf)
 	if err != nil {
 		client.Close()
-		return nil, nil, fmt.Errorf("build keyed submitter: %w", err)
+		return nil, nil, nil, fmt.Errorf("build keyed submitter: %w", err)
 	}
-	return sub, client.Close, nil
+	return sub, rpcBlockSource{client}, client.Close, nil
 }
 
 func buildPriceSource(c *config) (PriceSource, error) {
@@ -176,20 +187,25 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	var submitter VoteSubmitter
+	var (
+		submitter VoteSubmitter
+		blocks    BlockNumberSource
+	)
 	if c.keystorePath == "" {
 		logger.Print("WARN keystore not configured — running with stub submitter (logs only)")
 		submitter = NewStubSubmitter(oracle, logf)
+		blocks = &counterBlockSource{}
 	} else {
-		sub, closeFn, err := loadKeyedSubmitter(ctx, c, oracle, logf)
+		sub, src, closeFn, err := loadKeyedSubmitter(ctx, c, oracle, logf)
 		if err != nil {
 			logger.Fatalf("load keyed submitter: %v", err)
 		}
 		defer closeFn()
 		submitter = sub
+		blocks = src
 	}
 
-	feeder, err := NewFeeder(source, submitter, c.interval, logf)
+	feeder, err := NewFeeder(source, blocks, submitter, c.interval, c.targetOffset, logf)
 	if err != nil {
 		logger.Fatalf("build feeder: %v", err)
 	}

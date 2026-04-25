@@ -72,11 +72,14 @@ func NewKeyedSubmitter(
 	}, nil
 }
 
-// SubmitVote builds, signs, and broadcasts a submitVote(uint256) tx.
-// Errors at any stage are returned verbatim so the run loop can log
-// and retry on the next tick.
-func (s *keyedSubmitter) SubmitVote(ctx context.Context, priceUsd1e18 *big.Int) error {
-	calldata, err := EncodeSubmitVoteCalldata(priceUsd1e18)
+// SubmitVote builds, signs, and broadcasts a
+// submitVote(uint256,uint256) tx. Errors at any stage are returned
+// verbatim so the run loop can log and retry on the next tick.
+func (s *keyedSubmitter) SubmitVote(
+	ctx context.Context,
+	forBlockNumber, priceUsd1e18 *big.Int,
+) error {
+	calldata, err := EncodeSubmitVoteCalldata(forBlockNumber, priceUsd1e18)
 	if err != nil {
 		return fmt.Errorf("encode calldata: %w", err)
 	}
@@ -142,10 +145,11 @@ func (s *keyedSubmitter) SubmitVote(ctx context.Context, priceUsd1e18 *big.Int) 
 	}
 
 	s.logger(
-		"submitted vote: tx=%s from=%s nonce=%d price=%s gas=%d feeCap=%s tipCap=%s",
+		"submitted vote: tx=%s from=%s nonce=%d forBlock=%s price=%s gas=%d feeCap=%s tipCap=%s",
 		tx.Hash().Hex(),
 		s.from.Hex(),
 		nonce,
+		forBlockNumber.String(),
 		priceUsd1e18.String(),
 		gas,
 		feeCap.String(),

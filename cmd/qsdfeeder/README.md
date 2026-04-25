@@ -62,7 +62,8 @@ the RPC endpoint when `--chain-id=0` (the default).
 |------------------|--------------------------|-------|
 | `--rpc`          | `http://127.0.0.1:8545`  | go-qrl JSON-RPC endpoint. |
 | `--oracle`       | `ValidatorOracleAddress` | Accepts `0x` or `Q` prefix. |
-| `--interval`     | `30s`                    | Vote cadence. |
+| `--interval`     | `30s`                    | Vote cadence (wall-clock). Each tick targets `head + --target-offset`. |
+| `--target-offset`| `1`                      | Block offset added to the current head when targeting a vote. `1` = "the next block". |
 | `--price-source` | `static`                 | Only `static` is implemented. |
 | `--static-price` | `1.00`                   | USD per QRL when source is `static`. |
 | `--chain-id`     | `0`                      | `0` means auto-detect from RPC. |
@@ -76,10 +77,14 @@ the RPC endpoint when `--chain-id=0` (the default).
 The daemon ticks immediately on start (so the first vote does not
 wait a full interval), then on the configured ticker. Each cycle:
 
-1. Fetch the current price from the configured `PriceSource`.
-2. Encode `submitVote(uint256)` calldata against the price scaled
+1. Fetch the current chain head from the `BlockNumberSource`
+   (`qrlclient.BlockNumber` in keyed mode, a synthetic counter in
+   stub mode).
+2. Fetch the current price from the configured `PriceSource`.
+3. Encode `submitVote(uint256,uint256)` calldata with
+   `forBlockNumber = head + --target-offset` and the price scaled
    to `1e18`.
-3. Hand it to the configured `VoteSubmitter`.
+4. Hand it to the configured `VoteSubmitter`.
 
 In keyed mode each cycle additionally fetches the pending nonce, the
 latest base fee, and a tip-cap suggestion from the RPC, and adds 20%
@@ -91,15 +96,22 @@ Transient errors are logged and the loop continues. `SIGINT` /
 
 ## Wire format
 
-Vote calldata is the standard 4+32 layout:
+Vote calldata is the standard 4+32+32 layout:
 
 ```
-0x2844328f                                                          // submitVote(uint256) selector
-00000000000000000000000000000000000000000000000014d1120d7b160000   // 1.5e18, big-endian, left-padded
+0x6f93bfb7                                                          // submitVote(uint256,uint256) selector
+0000000000000000000000000000000000000000000000000000000000000003   // forBlockNumber (here: 3)
+00000000000000000000000000000000000000000000000014d1120d7b160000   // priceUsd1e18 (here: 1.5e18)
 ```
 
-The selector is computed from `keccak256("submitVote(uint256)")[:4]`
-at init and verified against the Solidity ABI in tests.
+The contract enforces `forBlockNumber == block.number` strictly: a
+tx that mines in any other block reverts. This eliminates the
+stale-vote-overwrites-fresh-vote race that affects late-mining
+mempool txs in the no-target design.
+
+The selector is computed from
+`keccak256("submitVote(uint256,uint256)")[:4]` at init and verified
+against the Solidity ABI in tests.
 
 
 # Tests

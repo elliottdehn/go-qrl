@@ -103,9 +103,13 @@ without provisioning a key. See
 [`cmd/qsdfeeder/README.md`](../cmd/qsdfeeder/README.md) for build
 and operation.
 
-The vote calldata is `submitVote(uint256)` — selector `0x2844328f`,
-followed by the price as a 32-byte big-endian uint256, scaled by
-`1e18` (so `$1.00 / QRL` is `1_000_000_000_000_000_000`).
+The vote calldata is `submitVote(uint256 forBlockNumber, uint256
+priceUsd1e18)` — selector `0x6f93bfb7`, followed by two 32-byte
+big-endian uint256s. Price is scaled by `1e18` (so `$1.00 / QRL` is
+`1_000_000_000_000_000_000`); `forBlockNumber` must equal
+`block.number` at execution time, or the contract reverts. Strict
+block targeting prevents a stuck-mempool tx from overwriting a
+fresher vote with a stale price when it eventually mines.
 
 ## Roadmap
 

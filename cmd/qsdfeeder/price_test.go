@@ -75,37 +75,60 @@ func TestStaticPriceSourceIsImmutable(t *testing.T) {
 }
 
 func TestEncodeSubmitVoteCalldata(t *testing.T) {
-	calldata, err := EncodeSubmitVoteCalldata(bigStr("1500000000000000000"))
+	forBlock := big.NewInt(0xabcd)
+	price := bigStr("1500000000000000000")
+	calldata, err := EncodeSubmitVoteCalldata(forBlock, price)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Selector for submitVote(uint256) is 0x2844328f.
-	if len(calldata) != 36 {
-		t.Fatalf("calldata length: got %d, want 36", len(calldata))
+	// Selector for submitVote(uint256,uint256) is 0x6f93bfb7.
+	if len(calldata) != 4+32+32 {
+		t.Fatalf("calldata length: got %d, want %d", len(calldata), 4+32+32)
 	}
-	wantSel := []byte{0x28, 0x44, 0x32, 0x8f}
+	wantSel := []byte{0x6f, 0x93, 0xbf, 0xb7}
 	for i, b := range wantSel {
 		if calldata[i] != b {
 			t.Fatalf("selector byte %d: got %02x, want %02x", i, calldata[i], b)
 		}
 	}
-	// uint256 portion is the value left-padded to 32 bytes, so byte 23
-	// onward is the actual significant bytes of 1.5e18.
-	wantArg := bigStr("1500000000000000000").Bytes()
-	gotArg := calldata[4+32-len(wantArg):]
-	if string(gotArg) != string(wantArg) {
-		t.Fatalf("uint256 arg: got %x, want %x", gotArg, wantArg)
+	// First arg: forBlockNumber, left-padded to 32 bytes at offset 4.
+	wantBlock := forBlock.Bytes()
+	gotBlock := calldata[4+32-len(wantBlock) : 4+32]
+	if string(gotBlock) != string(wantBlock) {
+		t.Fatalf("forBlockNumber arg: got %x, want %x", gotBlock, wantBlock)
+	}
+	// Second arg: price, at offset 4+32.
+	wantPrice := price.Bytes()
+	gotPrice := calldata[4+64-len(wantPrice):]
+	if string(gotPrice) != string(wantPrice) {
+		t.Fatalf("price arg: got %x, want %x", gotPrice, wantPrice)
 	}
 }
 
-func TestEncodeSubmitVoteCalldata_RejectsZeroAndNegative(t *testing.T) {
-	if _, err := EncodeSubmitVoteCalldata(big.NewInt(0)); err == nil {
-		t.Error("expected error for zero")
+func TestEncodeSubmitVoteCalldata_RejectsBadInputs(t *testing.T) {
+	one := big.NewInt(1)
+	cases := []struct {
+		name     string
+		forBlock *big.Int
+		price    *big.Int
+	}{
+		{"nil price", one, nil},
+		{"zero price", one, big.NewInt(0)},
+		{"negative price", one, big.NewInt(-1)},
+		{"nil block", nil, one},
+		{"negative block", big.NewInt(-1), one},
 	}
-	if _, err := EncodeSubmitVoteCalldata(big.NewInt(-1)); err == nil {
-		t.Error("expected error for negative")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := EncodeSubmitVoteCalldata(c.forBlock, c.price); err == nil {
+				t.Errorf("expected error")
+			}
+		})
 	}
-	if _, err := EncodeSubmitVoteCalldata(nil); err == nil {
-		t.Error("expected error for nil")
+
+	// forBlock = 0 is allowed: a chain that hasn't produced its first
+	// block yet might still receive a submission targeted at block 0.
+	if _, err := EncodeSubmitVoteCalldata(big.NewInt(0), one); err != nil {
+		t.Errorf("forBlock=0 should encode, got %v", err)
 	}
 }

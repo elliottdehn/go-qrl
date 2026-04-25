@@ -16,38 +16,56 @@ import (
 
 // VoteSubmitter dispatches a price vote to the on-chain
 // ValidatorOracle contract.
+//
+// forBlockNumber is the block in which the caller intends the vote
+// to land. The contract enforces strict equality: a tx that mines in
+// any other block reverts with WrongBlockNumber. Callers should set
+// forBlockNumber = currentHead + N for some small N matching their
+// expected propagation latency.
 type VoteSubmitter interface {
-	SubmitVote(ctx context.Context, priceUsd1e18 *big.Int) error
+	SubmitVote(ctx context.Context, forBlockNumber, priceUsd1e18 *big.Int) error
 	Address() common.Address
 }
 
 // submitVoteSelector is the 4-byte function selector for
 //
-//	submitVote(uint256)
+//	submitVote(uint256,uint256)
 //
-// computed once at init.
-var submitVoteSelector = crypto.Keccak256([]byte("submitVote(uint256)"))[:4]
+// computed once at init. Verified against `cast sig` in tests.
+var submitVoteSelector = crypto.Keccak256([]byte("submitVote(uint256,uint256)"))[:4]
 
 // EncodeSubmitVoteCalldata produces the calldata for a single
-// `submitVote(uint256)` invocation.
+// `submitVote(uint256,uint256)` invocation.
 //
-// Layout: 4-byte selector || 32-byte big-endian uint256.
-func EncodeSubmitVoteCalldata(priceUsd1e18 *big.Int) ([]byte, error) {
+// Layout: 4-byte selector || 32-byte big-endian forBlockNumber ||
+// 32-byte big-endian priceUsd1e18.
+func EncodeSubmitVoteCalldata(forBlockNumber, priceUsd1e18 *big.Int) ([]byte, error) {
+	if forBlockNumber == nil || forBlockNumber.Sign() < 0 {
+		return nil, fmt.Errorf("forBlockNumber must be non-negative")
+	}
 	if priceUsd1e18 == nil || priceUsd1e18.Sign() <= 0 {
 		return nil, fmt.Errorf("price must be positive")
 	}
-	// uint256 is at most 32 bytes; left-pad.
-	asBytes := priceUsd1e18.Bytes()
-	if len(asBytes) > 32 {
+	if len(priceUsd1e18.Bytes()) > 32 {
 		return nil, fmt.Errorf("price exceeds uint256")
 	}
+	if len(forBlockNumber.Bytes()) > 32 {
+		return nil, fmt.Errorf("forBlockNumber exceeds uint256")
+	}
+
+	out := make([]byte, 0, 4+32+32)
+	out = append(out, submitVoteSelector...)
+	out = append(out, padTo32(forBlockNumber)...)
+	out = append(out, padTo32(priceUsd1e18)...)
+	return out, nil
+}
+
+// padTo32 left-pads a non-negative big.Int to 32 bytes.
+func padTo32(v *big.Int) []byte {
+	asBytes := v.Bytes()
 	padded := make([]byte, 32)
 	copy(padded[32-len(asBytes):], asBytes)
-
-	out := make([]byte, 0, 4+32)
-	out = append(out, submitVoteSelector...)
-	out = append(out, padded...)
-	return out, nil
+	return padded
 }
 
 // stubSubmitter is a no-op VoteSubmitter that only logs what it
@@ -57,14 +75,15 @@ type stubSubmitter struct {
 	logger        func(format string, args ...any)
 }
 
-func (s *stubSubmitter) SubmitVote(_ context.Context, priceUsd1e18 *big.Int) error {
-	calldata, err := EncodeSubmitVoteCalldata(priceUsd1e18)
+func (s *stubSubmitter) SubmitVote(_ context.Context, forBlockNumber, priceUsd1e18 *big.Int) error {
+	calldata, err := EncodeSubmitVoteCalldata(forBlockNumber, priceUsd1e18)
 	if err != nil {
 		return err
 	}
 	s.logger(
-		"[stub] would submitVote oracle=%s price=%s calldata=0x%x",
+		"[stub] would submitVote oracle=%s forBlock=%s price=%s calldata=0x%x",
 		s.oracleAddress.Hex(),
+		forBlockNumber.String(),
 		priceUsd1e18.String(),
 		calldata,
 	)
