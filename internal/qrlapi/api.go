@@ -1012,6 +1012,7 @@ type RPCTransaction struct {
 	Type             hexutil.Uint64    `json:"type"`
 	Accesses         *types.AccessList `json:"accessList,omitempty"`
 	ChainID          *hexutil.Big      `json:"chainId,omitempty"`
+	Paymaster        *common.Address   `json:"paymaster,omitempty"`
 	Descriptor       hexutil.Bytes     `json:"descriptor"`
 	ExtraParams      hexutil.Bytes     `json:"extraParams"`
 	PublicKey        hexutil.Bytes     `json:"publicKey"`
@@ -1065,6 +1066,19 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 		} else {
 			result.GasPrice = (*hexutil.Big)(tx.GasFeeCap())
 		}
+	case types.PaymasterDynamicFeeTxType:
+		al := tx.AccessList()
+		result.Accesses = &al
+		result.ChainID = (*hexutil.Big)(tx.ChainId())
+		result.GasFeeCap = (*hexutil.Big)(tx.GasFeeCap())
+		result.GasTipCap = (*hexutil.Big)(tx.GasTipCap())
+		result.Paymaster = tx.Paymaster()
+		// Paymaster txs settle fees in iQRL via the paymaster contract;
+		// the validator receives gasUsed * gasPrice in iQRL with no
+		// base-fee burn. The reported "gas price" is the signed
+		// gasFeeCap regardless of inclusion (no effective-tip math
+		// applies — the validator gets the full bid).
+		result.GasPrice = (*hexutil.Big)(tx.GasFeeCap())
 	}
 	return result
 }

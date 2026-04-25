@@ -39,6 +39,11 @@ type txJSON struct {
 	Input                *hexutil.Bytes  `json:"input"`
 	AccessList           *AccessList     `json:"accessList,omitempty"`
 
+	// Paymaster is only set for type 0x04 (PaymasterDynamicFeeTx);
+	// omitempty keeps the wire format identical for plain
+	// DynamicFeeTx so existing clients are unaffected.
+	Paymaster *common.Address `json:"paymaster,omitempty"`
+
 	Descriptor  *hexutil.Bytes `json:"descriptor"`
 	ExtraParams *hexutil.Bytes `json:"extraParams"`
 	Signature   *hexutil.Bytes `json:"signature"`
@@ -72,6 +77,22 @@ func (tx *Transaction) MarshalJSON() ([]byte, error) {
 		enc.ExtraParams = (*hexutil.Bytes)(&itx.ExtraParams)
 		enc.Signature = (*hexutil.Bytes)(&itx.Signature)
 		enc.PublicKey = (*hexutil.Bytes)(&itx.PublicKey)
+	case *PaymasterDynamicFeeTx:
+		enc.ChainID = (*hexutil.Big)(itx.ChainID)
+		enc.Nonce = (*hexutil.Uint64)(&itx.Nonce)
+		enc.To = tx.To()
+		enc.Gas = (*hexutil.Uint64)(&itx.Gas)
+		enc.MaxFeePerGas = (*hexutil.Big)(itx.GasFeeCap)
+		enc.MaxPriorityFeePerGas = (*hexutil.Big)(itx.GasTipCap)
+		enc.Value = (*hexutil.Big)(itx.Value)
+		enc.Input = (*hexutil.Bytes)(&itx.Data)
+		enc.AccessList = &itx.AccessList
+		enc.Paymaster = itx.Paymaster
+		desc := hexutil.Bytes(itx.Descriptor[:])
+		enc.Descriptor = &desc
+		enc.ExtraParams = (*hexutil.Bytes)(&itx.ExtraParams)
+		enc.Signature = (*hexutil.Bytes)(&itx.Signature)
+		enc.PublicKey = (*hexutil.Bytes)(&itx.PublicKey)
 	}
 	return json.Marshal(&enc)
 }
@@ -87,6 +108,64 @@ func (tx *Transaction) UnmarshalJSON(input []byte) error {
 	// Decode / verify fields according to transaction type.
 	var inner TxData
 	switch dec.Type {
+	case PaymasterDynamicFeeTxType:
+		var itx PaymasterDynamicFeeTx
+		inner = &itx
+		if dec.ChainID == nil {
+			return errors.New("missing required field 'chainId' in transaction")
+		}
+		itx.ChainID = (*big.Int)(dec.ChainID)
+		if dec.Nonce == nil {
+			return errors.New("missing required field 'nonce' in transaction")
+		}
+		itx.Nonce = uint64(*dec.Nonce)
+		if dec.To != nil {
+			itx.To = dec.To
+		}
+		if dec.Gas == nil {
+			return errors.New("missing required field 'gas' for txdata")
+		}
+		itx.Gas = uint64(*dec.Gas)
+		if dec.MaxPriorityFeePerGas == nil {
+			return errors.New("missing required field 'maxPriorityFeePerGas' for txdata")
+		}
+		itx.GasTipCap = (*big.Int)(dec.MaxPriorityFeePerGas)
+		if dec.MaxFeePerGas == nil {
+			return errors.New("missing required field 'maxFeePerGas' for txdata")
+		}
+		itx.GasFeeCap = (*big.Int)(dec.MaxFeePerGas)
+		if dec.Value == nil {
+			return errors.New("missing required field 'value' in transaction")
+		}
+		itx.Value = (*big.Int)(dec.Value)
+		if dec.Input == nil {
+			return errors.New("missing required field 'input' in transaction")
+		}
+		itx.Data = *dec.Input
+		if dec.AccessList != nil {
+			itx.AccessList = *dec.AccessList
+		}
+		if dec.Paymaster == nil {
+			return errors.New("missing required field 'paymaster' for paymaster tx")
+		}
+		itx.Paymaster = dec.Paymaster
+		if dec.Descriptor == nil {
+			return errors.New("missing required field 'descriptor' in transaction")
+		}
+		copy(itx.Descriptor[:], *dec.Descriptor)
+		if dec.ExtraParams == nil {
+			return errors.New("missing required field 'extraParams' in transaction")
+		}
+		itx.ExtraParams = *dec.ExtraParams
+		if dec.Signature == nil {
+			return errors.New("missing required field 'signature' in transaction")
+		}
+		itx.Signature = *dec.Signature
+		if dec.PublicKey == nil {
+			return errors.New("missing required field 'publicKey' in transaction")
+		}
+		itx.PublicKey = *dec.PublicKey
+
 	case DynamicFeeTxType:
 		var itx DynamicFeeTx
 		inner = &itx

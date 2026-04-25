@@ -119,6 +119,51 @@ func TestPaymasterTx_SignerCoversPaymaster(t *testing.T) {
 	}
 }
 
+// TestPaymasterTx_JSONRoundTrip verifies that JSON marshalling
+// preserves the paymaster field and that unmarshalling reconstructs
+// the right tx type.
+func TestPaymasterTx_JSONRoundTrip(t *testing.T) {
+	pm := common.BytesToAddress(common.FromHex("0x0000000000000000000000000000000000010003"))
+	to := common.BytesToAddress(common.FromHex("0x000000000000000000000000000000000000a11c"))
+
+	w := paymasterTestWallet(t)
+	signer := LatestSignerForChainID(big.NewInt(1337))
+	tx, err := SignNewTx(w, signer, &PaymasterDynamicFeeTx{
+		ChainID:   big.NewInt(1337),
+		Nonce:     7,
+		GasTipCap: big.NewInt(1_000_000_000),
+		GasFeeCap: big.NewInt(2_000_000_000),
+		Gas:       100_000,
+		To:        &to,
+		Value:     big.NewInt(0),
+		Data:      []byte{0x01, 0x02, 0x03},
+		Paymaster: &pm,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := tx.MarshalJSON()
+	if err != nil {
+		t.Fatalf("MarshalJSON: %v", err)
+	}
+	// QRL renders addresses with a "Q" prefix.
+	if !bytes.Contains(encoded, []byte(`"paymaster":"Q0000000000000000000000000000000000010003"`)) {
+		t.Errorf("paymaster field missing from JSON: %s", encoded)
+	}
+
+	var dec Transaction
+	if err := dec.UnmarshalJSON(encoded); err != nil {
+		t.Fatalf("UnmarshalJSON: %v", err)
+	}
+	if dec.Type() != PaymasterDynamicFeeTxType {
+		t.Errorf("type: got %d, want %d", dec.Type(), PaymasterDynamicFeeTxType)
+	}
+	if got := dec.Paymaster(); got == nil || *got != pm {
+		t.Errorf("paymaster: got %v, want %v", got, pm)
+	}
+}
+
 // TestDynamicFeeTx_PaymasterIsNil ensures the standard DynamicFeeTx
 // reports a nil paymaster — the backwards-compat path for
 // non-paymaster txs.
