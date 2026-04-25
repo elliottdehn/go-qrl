@@ -242,21 +242,19 @@ func (st *StateTransition) buyGas() error {
 	st.gasRemaining += st.msg.GasLimit
 	st.initialGas = st.msg.GasLimit
 
-	// Paymaster path: route the fee debit through the paymaster
-	// contract instead of pulling native QRL from the sender. The
-	// caller still needs the value-transfer balance (msg.Value), but
-	// the gas budget itself is escrowed by the paymaster — typically
-	// in iQRL, though the chain only requires that the paymaster is
-	// an allowlisted contract that implements escrow()/settle().
+	// Paymaster path: the actual escrow system call happens AFTER
+	// state.Prepare() in TransitionDb (the EVM call inside escrow
+	// would otherwise warm the access list before Prepare sets it
+	// up, leaving the journal in an inconsistent state on revert).
+	// Here we just verify the caller has enough native balance for
+	// the value-transfer leg (gas itself is paid in the paymaster's
+	// chosen asset, validated separately at escrow time).
 	if st.msg.Paymaster != nil {
-		// msg.Value is paid in native QRL even in paymaster txs —
-		// only the gas fee is delegated. So the sender still needs
-		// at least msg.Value of native balance.
 		if have, want := st.state.GetBalance(st.msg.From), st.msg.Value; have.Cmp(want) < 0 {
 			return fmt.Errorf("%w: address %v have %v want %v (value transfer)",
 				ErrInsufficientFunds, st.msg.From.Hex(), have, want)
 		}
-		return st.paymasterEscrow(mgval)
+		return nil
 	}
 
 	balanceCheck := new(big.Int).Set(mgval)
@@ -313,7 +311,15 @@ func (st *StateTransition) preCheck() error {
 		}
 		// This will panic if baseFee is nil, but basefee presence is verified
 		// as part of header validation.
-		if msg.GasFeeCap.Cmp(st.qrvm.Context.BaseFee) < 0 {
+		//
+		// Paymaster txs are exempt: their GasFeeCap is denominated in
+		// the paymaster's chosen asset (iQRL for PayWithIQRL), not in
+		// QRL, so a direct comparison against the QRL base fee is a
+		// unit error. The paymaster path computes baseFeeIQRL via the
+		// oracle and floors the tip at zero (post-execution split
+		// can't put the validator into a negative position even when
+		// the converted base fee exceeds the signed cap).
+		if msg.Paymaster == nil && msg.GasFeeCap.Cmp(st.qrvm.Context.BaseFee) < 0 {
 			return fmt.Errorf("%w: address %v, maxFeePerGas: %s baseFee: %s", ErrFeeCapTooLow,
 				msg.From.Hex(), msg.GasFeeCap, st.qrvm.Context.BaseFee)
 		}
@@ -386,6 +392,17 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	// - prepare accessList
 	st.state.Prepare(rules, msg.From, st.qrvm.Context.Coinbase, msg.To, vm.ActivePrecompiles(rules), msg.AccessList)
 
+	// Paymaster escrow: deferred from buyGas() to here so the EVM
+	// call's access-list warming happens with the access list
+	// already initialized by Prepare. mgval (gasLimit*gasPrice) is
+	// the maxFee the paymaster pulls from the sender.
+	if msg.Paymaster != nil {
+		mgval := new(big.Int).Mul(new(big.Int).SetUint64(st.initialGas), msg.GasPrice)
+		if err := st.paymasterEscrow(mgval); err != nil {
+			return nil, err
+		}
+	}
+
 	// Snapshot the free-vote eligibility BEFORE execution: the
 	// votes[from].blockNumber slot will be overwritten by a
 	// successful submitVote(), so any post-execution read would
@@ -418,26 +435,33 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 		// both deflate their respective asset by gasUsed*baseFee
 		// and tip the validator the remainder.
 		baseFeeIQRL := paymasterBaseFeeIQRL(st.state, st.qrvm.Context.BaseFee, st.qrvm.Context.BlockNumber.Uint64())
-		burnAmount := new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), baseFeeIQRL)
 
-		// effectiveGasPriceIQRL = min(GasFeeCap, baseFeeIQRL + GasTipCap).
+		// Cap the burn at the user's signed gasFeeCap: if the
+		// oracle-derived baseFeeIQRL has drifted above what the
+		// user committed to, the burn just absorbs the entire
+		// signed cap (no tip). Total fee never exceeds
+		// gasUsed * gasFeeCap ≤ maxFee = gasLimit * gasFeeCap.
+		burnPerGas := new(big.Int).Set(baseFeeIQRL)
+		if burnPerGas.Cmp(msg.GasFeeCap) > 0 {
+			burnPerGas.Set(msg.GasFeeCap)
+		}
+		burnAmount := new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), burnPerGas)
+
+		// effGasPrice = min(GasFeeCap, baseFeeIQRL + GasTipCap).
 		effGasPrice := new(big.Int).Add(baseFeeIQRL, msg.GasTipCap)
 		if effGasPrice.Cmp(msg.GasFeeCap) > 0 {
 			effGasPrice.Set(msg.GasFeeCap)
 		}
-		// Floor the tip at zero — if the chain's baseFeeIQRL has
-		// drifted above the tx's signed fee cap, the validator
-		// just gets nothing rather than a negative tip.
-		tipPerGas := new(big.Int).Sub(effGasPrice, baseFeeIQRL)
+		// tipPerGas = effGasPrice - burnPerGas, floored at zero.
+		tipPerGas := new(big.Int).Sub(effGasPrice, burnPerGas)
 		if tipPerGas.Sign() < 0 {
 			tipPerGas.SetInt64(0)
 		}
 		tipAmount := new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), tipPerGas)
 
 		maxFee := new(big.Int).Mul(new(big.Int).SetUint64(st.initialGas), msg.GasPrice)
-		// Defensive cap: burn + tip must not exceed maxFee. With
-		// GasFeeCap == msg.GasPrice (the EIP-1559 invariant the
-		// signer enforces), this always holds; assert for safety.
+		// Defensive cap: burn + tip must not exceed maxFee. The
+		// per-gas caps above guarantee this; assert for safety.
 		if new(big.Int).Add(burnAmount, tipAmount).Cmp(maxFee) > 0 {
 			return nil, fmt.Errorf("paymaster settle: burn+tip %s exceeds maxFee %s",
 				new(big.Int).Add(burnAmount, tipAmount), maxFee)

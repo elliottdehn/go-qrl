@@ -171,6 +171,53 @@ func AddQSDStabilityLayer(alloc GenesisAlloc, _ QSDPredeployParams) {
 	}
 }
 
+// SeedQSDDevValidator mutates the genesis alloc to install
+// `validator` as the sole entry in ValidatorOracle's validator set
+// AND pre-seeds a fresh vote at `priceUsd1e18`. Used only by the
+// dev-genesis path: real networks bring the validator set up via
+// the consensus → setValidatorSet system call, which doesn't fire
+// in --dev mode (no CL is populating PayloadAttributes.Validators).
+//
+// The seeded vote is dated at block 2^60 to keep it permanently
+// "fresh" relative to the staleness window — the dev faucet doesn't
+// need to run qsdfeeder to keep the oracle alive.
+func SeedQSDDevValidator(alloc GenesisAlloc, validator common.Address, priceUsd1e18 *big.Int) {
+	acct, ok := alloc[ValidatorOracleAddress]
+	if !ok {
+		panic("SeedQSDDevValidator: ValidatorOracle predeploy not present in alloc")
+	}
+	if acct.Storage == nil {
+		acct.Storage = make(map[common.Hash]common.Hash)
+	}
+
+	// validators[] length at slot 0 = 1.
+	lengthSlot := common.Hash{}
+	lengthSlot[31] = byte(validatorOracleValidatorsLengthSlot)
+	acct.Storage[lengthSlot] = common.BigToHash(big.NewInt(1))
+
+	// validators[0] at keccak256(slot 0).
+	arrayBase := crypto.Keccak256Hash(common.LeftPadBytes(
+		big.NewInt(validatorOracleValidatorsLengthSlot).Bytes(), 32))
+	acct.Storage[arrayBase] = common.BytesToHash(common.LeftPadBytes(validator.Bytes(), 32))
+
+	// validatorIndex[validator] = 1.
+	acct.Storage[ValidatorIndexStorageSlot(validator)] = common.BigToHash(big.NewInt(1))
+
+	// votes[validator]: pack price (uint128, low 16 bytes of slot)
+	// and a far-future blockNumber (uint64, bytes [8:16]) so the
+	// vote stays "fresh" forever for staleness purposes.
+	var voteSlot common.Hash
+	priceBytes := common.LeftPadBytes(priceUsd1e18.Bytes(), 16)
+	copy(voteSlot[16:32], priceBytes)
+	const farFutureBlock uint64 = 1 << 60
+	for i := 0; i < 8; i++ {
+		voteSlot[15-i] = byte(farFutureBlock >> (8 * i))
+	}
+	acct.Storage[ValidatorVoteStorageSlot(validator)] = voteSlot
+
+	alloc[ValidatorOracleAddress] = acct
+}
+
 // parseQSDPredeployDump unmarshals the embedded vm.dumpState JSON
 // into a lower-cased-address map.
 func parseQSDPredeployDump() (map[string]dumpedAccount, error) {

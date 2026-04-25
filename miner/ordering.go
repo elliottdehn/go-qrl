@@ -39,6 +39,15 @@ type txWithMinerFee struct {
 func newTxWithMinerFee(tx *txpool.LazyTransaction, from common.Address, baseFee *big.Int) (*txWithMinerFee, error) {
 	tip := new(big.Int).Set(tx.GasTipCap)
 	if baseFee != nil {
+		// Paymaster txs have GasFeeCap denominated in the paymaster's
+		// fee asset (e.g. iQRL), not in native QRL. Comparing against
+		// QRL baseFee would be a unit error and can spuriously evict
+		// otherwise-valid txs. Use the signed tipCap as the heap key
+		// directly; cross-asset ranking lives in the priced-list
+		// fairness factor on the txpool side.
+		if tx.Tx != nil && tx.Tx.Paymaster() != nil {
+			return &txWithMinerFee{tx: tx, from: from, fees: tip}, nil
+		}
 		if tx.GasFeeCap.Cmp(baseFee) < 0 {
 			return nil, types.ErrGasFeeCapTooLow
 		}

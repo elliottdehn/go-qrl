@@ -279,7 +279,7 @@ func New(config Config, chain BlockChain) *LegacyPool {
 // pool.
 func (pool *LegacyPool) Filter(tx *types.Transaction) bool {
 	switch tx.Type() {
-	case types.DynamicFeeTxType:
+	case types.DynamicFeeTxType, types.PaymasterDynamicFeeTxType:
 		return true
 	default:
 		return false
@@ -540,9 +540,18 @@ func (pool *LegacyPool) Pending(filter txpool.PendingFilter) map[common.Address]
 	for addr, list := range pool.pending {
 		txs := list.Flatten()
 
-		// If the miner requests tip enforcement, cap the lists now
+		// If the miner requests tip enforcement, cap the lists now.
+		// Paymaster txs are exempt from this filter — their fee is
+		// denominated in the paymaster's chosen asset (e.g. iQRL),
+		// not in native QRL, so a direct EffectiveGasTip comparison
+		// against the QRL minTip is a unit error. Block-builder
+		// fairness lives in the priced heap; the miner just needs
+		// to not stall the nonce queue here.
 		if minTipBig != nil && !pool.locals.contains(addr) {
 			for i, tx := range txs {
+				if tx.Paymaster() != nil {
+					continue
+				}
 				if tx.EffectiveGasTipIntCmp(minTipBig, baseFeeBig) < 0 {
 					txs = txs[:i]
 					break

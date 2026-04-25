@@ -529,10 +529,15 @@ func DeveloperGenesisBlock(gasLimit uint64, faucet common.Address) *Genesis {
 	}
 
 	// Pre-deploy the QSD stability layer: ValidatorOracle + InverseQRL
-	// + QSD. Reserves their well-known addresses so that downstream
-	// tooling (deploy scripts, the qsdfeeder daemon) can target them
-	// without lookup. Owner of the oracle is the dev-mode faucet.
+	// + QSD + PayWithIQRL. Real networks rely on the consensus →
+	// setValidatorSet bridge (PayloadAttributes.Validators populated
+	// by the CL) to bring the oracle's validator set up. In --dev
+	// mode there is no CL, so we additionally seed the dev faucet as
+	// the sole validator with a permanent fresh $1.00 vote. Without
+	// this seed, InverseQRL.mint and QSD.redeem revert immediately
+	// on the oracle-health check.
 	AddQSDStabilityLayer(alloc, DefaultQSDPredeployParams(faucet))
+	SeedQSDDevValidator(alloc, faucet, big.NewInt(1_000_000_000_000_000_000)) // $1.00
 
 	return &Genesis{
 		Config:   &config,
