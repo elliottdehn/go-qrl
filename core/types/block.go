@@ -119,6 +119,17 @@ func (h *Header) EmptyReceipts() bool {
 type Body struct {
 	Transactions []*Transaction
 	Withdrawals  []*Withdrawal `rlp:"optional"`
+
+	// Validators carries the chain's active PoS validator set as of
+	// this block. Consumed by the QSD ValidatorOracle predeploy via
+	// a system call at the start of state processing. Optional in
+	// the RLP form so older blocks decode unchanged.
+	//
+	// Until the engine API is extended to populate this field, blocks
+	// will carry a nil list and the system call is a no-op — the
+	// oracle's set stays whatever it was last set to (typically empty
+	// at genesis).
+	Validators []common.Address `rlp:"optional"`
 }
 
 // Block represents a QRL block.
@@ -142,6 +153,7 @@ type Block struct {
 	header       *Header
 	transactions Transactions
 	withdrawals  Withdrawals
+	validators   []common.Address // see Body.Validators
 
 	// caches
 	hash atomic.Pointer[common.Hash]
@@ -157,7 +169,8 @@ type Block struct {
 type extblock struct {
 	Header      *Header
 	Txs         []*Transaction
-	Withdrawals []*Withdrawal `rlp:"optional"`
+	Withdrawals []*Withdrawal   `rlp:"optional"`
+	Validators  []common.Address `rlp:"optional"`
 }
 
 // NewBlock creates a new block. The input data is copied, changes to header and to the
@@ -174,6 +187,7 @@ func NewBlock(header *Header, body *Body, receipts []*Receipt, hasher TrieHasher
 		b           = NewBlockWithHeader(header)
 		txs         = body.Transactions
 		withdrawals = body.Withdrawals
+		validators  = body.Validators
 	)
 
 	if len(txs) == 0 {
@@ -200,6 +214,13 @@ func NewBlock(header *Header, body *Body, receipts []*Receipt, hasher TrieHasher
 		hash := DeriveSha(Withdrawals(withdrawals), hasher)
 		b.header.WithdrawalsHash = &hash
 		b.withdrawals = slices.Clone(withdrawals)
+	}
+
+	// Validators are not currently committed to the header. A future
+	// commit will add a ValidatorsHash field for full block-level
+	// authentication; for now the field is body-only.
+	if len(validators) > 0 {
+		b.validators = slices.Clone(validators)
 	}
 
 	return b
@@ -232,7 +253,7 @@ func (b *Block) DecodeRLP(s *rlp.Stream) error {
 	if err := s.Decode(&eb); err != nil {
 		return err
 	}
-	b.header, b.transactions, b.withdrawals = eb.Header, eb.Txs, eb.Withdrawals
+	b.header, b.transactions, b.withdrawals, b.validators = eb.Header, eb.Txs, eb.Withdrawals, eb.Validators
 	b.size.Store(rlp.ListSize(size))
 	return nil
 }
@@ -243,20 +264,22 @@ func (b *Block) EncodeRLP(w io.Writer) error {
 		Header:      b.header,
 		Txs:         b.transactions,
 		Withdrawals: b.withdrawals,
+		Validators:  b.validators,
 	})
 }
 
 // Body returns the non-header content of the block.
 // Note the returned data is not an independent copy.
 func (b *Block) Body() *Body {
-	return &Body{b.transactions, b.withdrawals}
+	return &Body{b.transactions, b.withdrawals, b.validators}
 }
 
 // Accessors for body data. These do not return a copy because the content
 // of the body slices does not affect the cached hash/size in block.
 
-func (b *Block) Transactions() Transactions { return b.transactions }
-func (b *Block) Withdrawals() Withdrawals   { return b.withdrawals }
+func (b *Block) Transactions() Transactions   { return b.transactions }
+func (b *Block) Withdrawals() Withdrawals     { return b.withdrawals }
+func (b *Block) Validators() []common.Address { return b.validators }
 
 func (b *Block) Transaction(hash common.Hash) *Transaction {
 	for _, transaction := range b.transactions {
@@ -335,6 +358,7 @@ func (b *Block) WithSeal(header *Header) *Block {
 		header:       CopyHeader(header),
 		transactions: b.transactions,
 		withdrawals:  b.withdrawals,
+		validators:   b.validators,
 	}
 }
 
@@ -345,6 +369,7 @@ func (b *Block) WithBody(body Body) *Block {
 		header:       b.header,
 		transactions: slices.Clone(body.Transactions),
 		withdrawals:  slices.Clone(body.Withdrawals),
+		validators:   slices.Clone(body.Validators),
 	}
 	return block
 }

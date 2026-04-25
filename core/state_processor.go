@@ -71,6 +71,17 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 		signer  = types.MakeSigner(p.config)
 	)
 
+	// Mirror the chain's PoS validator set into the ValidatorOracle
+	// predeploy via a system call BEFORE executing transactions, so
+	// any submitVote / free-vote machinery in this block sees the
+	// fresh set. No-op when the body carries no validator list (e.g.
+	// blocks built before the engine API was extended to populate it).
+	if vs := block.Validators(); len(vs) > 0 {
+		if err := ProcessSetValidatorSet(vmenv, vs); err != nil {
+			return nil, nil, 0, fmt.Errorf("setValidatorSet system call: %w", err)
+		}
+	}
+
 	// Iterate over and process the individual transactions
 	for i, tx := range block.Transactions() {
 		msg, err := TransactionToMessage(tx, signer, header.BaseFee)

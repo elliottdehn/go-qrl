@@ -36,6 +36,14 @@ type PayloadAttributes struct {
 	Random                common.Hash         `json:"prevRandao"            gencodec:"required"`
 	SuggestedFeeRecipient common.Address      `json:"suggestedFeeRecipient" gencodec:"required"`
 	Withdrawals           []*types.Withdrawal `json:"withdrawals"`
+
+	// Validators is the chain's active PoS validator set as of the
+	// block being built. The execution layer system-calls
+	// ValidatorOracle.setValidatorSet(addresses[]) at the start of
+	// state processing using this list, so submitVote / free-vote
+	// machinery in the same block sees the up-to-date set. Optional;
+	// nil leaves the on-chain validator set unchanged.
+	Validators []common.Address `json:"validators,omitempty"`
 }
 
 // JSON type overrides for PayloadAttributes.
@@ -62,6 +70,10 @@ type ExecutableData struct {
 	BlockHash     common.Hash         `json:"blockHash"     gencodec:"required"`
 	Transactions  [][]byte            `json:"transactions"  gencodec:"required"`
 	Withdrawals   []*types.Withdrawal `json:"withdrawals"`
+	// Validators mirrors PayloadAttributes.Validators — see comment
+	// there. Carried in the executable data so a CL relay/builder
+	// can sign over the value.
+	Validators []common.Address `json:"validators,omitempty"`
 }
 
 // JSON type overrides for executableData.
@@ -207,7 +219,11 @@ func ExecutableDataToBlockNoHash(data ExecutableData) (*types.Block, error) {
 		WithdrawalsHash: withdrawalsRoot,
 	}
 	return types.NewBlockWithHeader(header).
-			WithBody(types.Body{Transactions: txs, Withdrawals: data.Withdrawals}),
+			WithBody(types.Body{
+				Transactions: txs,
+				Withdrawals:  data.Withdrawals,
+				Validators:   data.Validators,
+			}),
 		nil
 }
 
@@ -230,6 +246,7 @@ func BlockToExecutableData(block *types.Block, fees *big.Int) *ExecutionPayloadE
 		Random:        block.Random(),
 		ExtraData:     block.Extra(),
 		Withdrawals:   block.Withdrawals(),
+		Validators:    block.Validators(),
 	}
 
 	return &ExecutionPayloadEnvelope{

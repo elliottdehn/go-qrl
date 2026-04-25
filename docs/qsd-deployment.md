@@ -102,13 +102,26 @@ become active in the beacon set. They become "fresh" — contributing
 to the median and the `healthy()` quorum — as soon as they post
 their first vote within the last `voteStalenessBlocks` blocks.
 
-**Open caveat**: at the moment of writing this runbook, the
-consensus → setValidatorSet bridge is not yet wired in
-`consensus/beacon/`. The contract surface and on-chain semantics
-are final; the engine call site is the remaining piece. Until that
-ships, dev-network operators can drive the system call manually
-(e.g. via a small test fixture that pranks `0xff..fe`) — but no
-real network should run without the bridge.
+**How it works under the hood**: the engine API's
+`PayloadAttributes` carries an optional `validators []address`
+field. The CL populates it with the active beacon set when
+requesting a payload; the EL plumbs it through `BuildPayloadArgs`
+→ `Body.Validators` → block. At the start of state processing
+(before transactions execute), `core.ProcessSetValidatorSet`
+issues a system call from `0xff..fe` to
+`ValidatorOracle.setValidatorSet(addresses[])` and the contract
+diffs against its current set. Anything in the new set but not
+the old is added; anything in the old but not the new is removed
+and its `votes[]` entry deleted. Validators present in both keep
+their existing vote.
+
+**Open caveat**: the body's `Validators` field is not yet
+header-committed (no `ValidatorsHash` in the header). A block
+proposer could theoretically serve different validator sets to
+different peers and a non-block-proposer node has no compact way
+to verify which is canonical. Production networks should land
+the header commitment before depending on this for security-
+critical behaviour.
 
 ## 4. Running the price feeder
 

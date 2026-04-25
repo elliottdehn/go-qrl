@@ -176,11 +176,14 @@ depends on later ones.
 
 ## Open work
 
-  - **Consensus → setValidatorSet bridge.** The contract surface
-    and on-chain semantics are final, but the engine call site in
-    `consensus/beacon/` is not yet wired. Until it is, no real
-    network can drive the oracle's validator set. Dev networks can
-    drive it manually by pranking the sentinel sender in tests.
+  - **`ValidatorsHash` header commitment.** The block body carries
+    `Validators []common.Address`, the engine API plumbs it from
+    PayloadAttributes through to `state_processor.Process`, and
+    the system call fires at the start of every block. What's
+    missing is a header-level Merkle commitment to the list — like
+    `WithdrawalsHash` for withdrawals — so a block proposer can't
+    serve different `Validators` to different peers. Until that
+    lands, the validator set in a block is not consensus-bound.
   - **Wallet / SDK support** for constructing type-0x04 txs. The
     chain accepts them via `eth_sendRawTransaction` and the JSON
     wire format is documented; client-side tooling that builds and
