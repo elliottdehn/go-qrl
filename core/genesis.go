@@ -517,20 +517,28 @@ func DeveloperGenesisBlock(gasLimit uint64, faucet common.Address) *Genesis {
 	config := *params.AllDevChainProtocolChanges
 
 	// Assemble and return the genesis with the precompiles and faucet pre-funded
+	alloc := map[common.Address]GenesisAccount{
+		common.BytesToAddress([]byte{1}): {Balance: big.NewInt(1)}, // DepositRoot
+		common.BytesToAddress([]byte{2}): {Balance: big.NewInt(1)}, // SHA256
+		common.BytesToAddress([]byte{4}): {Balance: big.NewInt(1)}, // Identity
+		common.BytesToAddress([]byte{5}): {Balance: big.NewInt(1)}, // ModExp
+		common.BytesToAddress([]byte{6}): {Balance: big.NewInt(1)}, // ECAdd
+		common.BytesToAddress([]byte{7}): {Balance: big.NewInt(1)}, // ECScalarMul
+		common.BytesToAddress([]byte{8}): {Balance: big.NewInt(1)}, // ECPairing
+		faucet:                           {Balance: new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(9))},
+	}
+
+	// Pre-deploy the QSD stability layer: ValidatorOracle + InverseQRL
+	// + QSD. Reserves their well-known addresses so that downstream
+	// tooling (deploy scripts, the qsdfeeder daemon) can target them
+	// without lookup. Owner of the oracle is the dev-mode faucet.
+	AddQSDStabilityLayer(alloc, DefaultQSDPredeployParams(faucet))
+
 	return &Genesis{
 		Config:   &config,
 		GasLimit: gasLimit,
 		BaseFee:  big.NewInt(params.InitialBaseFee),
-		Alloc: map[common.Address]GenesisAccount{
-			common.BytesToAddress([]byte{1}): {Balance: big.NewInt(1)}, // DepositRoot
-			common.BytesToAddress([]byte{2}): {Balance: big.NewInt(1)}, // SHA256
-			common.BytesToAddress([]byte{4}): {Balance: big.NewInt(1)}, // Identity
-			common.BytesToAddress([]byte{5}): {Balance: big.NewInt(1)}, // ModExp
-			common.BytesToAddress([]byte{6}): {Balance: big.NewInt(1)}, // ECAdd
-			common.BytesToAddress([]byte{7}): {Balance: big.NewInt(1)}, // ECScalarMul
-			common.BytesToAddress([]byte{8}): {Balance: big.NewInt(1)}, // ECPairing
-			faucet:                           {Balance: new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(9))},
-		},
+		Alloc:    alloc,
 	}
 }
 
