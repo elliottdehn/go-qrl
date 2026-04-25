@@ -165,14 +165,24 @@ depends on later ones.
 
 ## Open work
 
-These are deferred to follow-up branches:
+  - **ML-DSA-87 permit primitive.** OZ `ERC20Permit` uses
+    ECRECOVER (precompile `0x01`), which on this chain is replaced
+    with `DepositRoot`. So `iqrl.permit()` doesn't work as
+    inherited. Either reimplement `Permit` against an ML-DSA-87
+    recovery precompile (does one exist?) or design a chain-native
+    delegated-approval primitive. Practical impact today: a new
+    user's *first* paymaster tx requires a one-time
+    `iqrl.approve()` call paid in native QRL — see the deployment
+    runbook §7.
+  - **Wallet / SDK support** for constructing type-0x04 txs. The
+    chain accepts them via `eth_sendRawTransaction` and the JSON
+    wire format is documented; client-side tooling that builds and
+    signs them is still missing.
+  - **Richer paymaster auction.** Today the txpool ranks
+    paymaster txs against native txs via oracle-derived QRL
+    equivalence. A full auction (priority-fee for the paymaster,
+    tip-per-gas split between coinbase and paymaster, etc.) is
+    open work.
 
-  - **Wallet / RPC support** for the new tx type `0x04`. `eth_gasPrice`
-    semantics for iQRL-denominated fees, RPC plumbing for clients
-    constructing paymaster txs.
-  - **`iqrl.permit` shortcut** so users don't need a separate
-    approve tx before their first paymaster tx.
-  - **Block-builder fairness** between QRL-paid and iQRL-paid txs:
-    proper USD-comparable ordering rather than raw gas-price.
-  - **Production deployment runbook**: validator key management,
-    monitoring, on-chain owner rotation.
+For day-to-day operations see
+[`qsd-deployment.md`](qsd-deployment.md).
