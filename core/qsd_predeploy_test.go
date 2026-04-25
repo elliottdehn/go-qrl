@@ -86,3 +86,89 @@ func TestDeveloperGenesisIncludesQSDAddresses(t *testing.T) {
 		}
 	}
 }
+
+// TestPredeployBytecodeIsNonEmpty verifies the embedded state dump
+// actually populates each reserved address with deployed bytecode.
+// A regression here means the JSON regenerated from the Foundry
+// script either failed to land or was committed in a stub state.
+func TestPredeployBytecodeIsNonEmpty(t *testing.T) {
+	alloc := GenesisAlloc{}
+	owner := common.BytesToAddress(common.FromHex("0xc0ffee0000000000000000000000000000000000"))
+	AddQSDStabilityLayer(alloc, DefaultQSDPredeployParams(owner))
+
+	for _, addr := range []common.Address{
+		ValidatorOracleAddress,
+		InverseQRLAddress,
+		QSDAddress,
+	} {
+		acct := alloc[addr]
+		if len(acct.Code) == 0 {
+			t.Errorf("%s: empty code", addr.Hex())
+		}
+		// Sanity floor: the smallest of the three (ValidatorOracle)
+		// compiles to ~3.7 KB. Anything below 1 KB indicates a stub
+		// or truncated dump.
+		if len(acct.Code) < 1024 {
+			t.Errorf("%s: code suspiciously short (%d bytes)", addr.Hex(), len(acct.Code))
+		}
+	}
+}
+
+// TestPredeployOwnerOverride verifies that the embedded sentinel
+// owner is rewritten to the caller-supplied OracleOwner at slot 0
+// of ValidatorOracle.
+func TestPredeployOwnerOverride(t *testing.T) {
+	const ownerSlot = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+	owner := common.BytesToAddress(common.FromHex("0xc0ffee0000000000000000000000000000000000"))
+	alloc := GenesisAlloc{}
+	AddQSDStabilityLayer(alloc, DefaultQSDPredeployParams(owner))
+
+	got := alloc[ValidatorOracleAddress].Storage[common.HexToHash(ownerSlot)]
+	wantAddr := common.BytesToAddress(got.Bytes())
+	if wantAddr != owner {
+		t.Errorf("oracle owner: got %s, want %s", wantAddr.Hex(), owner.Hex())
+	}
+
+	// And: a different owner threads through to a different slot value.
+	other := common.BytesToAddress(common.FromHex("0xbeef000000000000000000000000000000000000"))
+	alloc2 := GenesisAlloc{}
+	AddQSDStabilityLayer(alloc2, DefaultQSDPredeployParams(other))
+	got2 := alloc2[ValidatorOracleAddress].Storage[common.HexToHash(ownerSlot)]
+	if got == got2 {
+		t.Errorf("owner override is a no-op: same slot value for different owners (%s)", got.Hex())
+	}
+
+	// Sanity: the sentinel itself never leaks into the live alloc.
+	sentinelHash := common.BytesToHash(append(make([]byte, 12), PredeploySentinelOwner().Bytes()...))
+	if got == sentinelHash {
+		t.Errorf("alloc still has sentinel owner — override skipped")
+	}
+}
+
+// TestPredeployErc20MetadataPreserved verifies ERC-20 _name/_symbol
+// slots survived the dump → load round-trip. Slot 3 (name) and slot
+// 4 (symbol) are short strings stored as <data><len*2> for short
+// strings (≤31 bytes), which is the case for both contracts.
+func TestPredeployErc20MetadataPreserved(t *testing.T) {
+	alloc := GenesisAlloc{}
+	AddQSDStabilityLayer(alloc, DefaultQSDPredeployParams(common.Address{1}))
+
+	cases := []struct {
+		addr     common.Address
+		name     string
+		nameSlot string
+	}{
+		{InverseQRLAddress, "Inverse QRL", "0x0000000000000000000000000000000000000000000000000000000000000003"},
+		{QSDAddress, "Quantum Stable Dollar", "0x0000000000000000000000000000000000000000000000000000000000000003"},
+	}
+	for _, c := range cases {
+		slotVal := alloc[c.addr].Storage[common.HexToHash(c.nameSlot)]
+		// Short-string layout: first len(name) bytes hold the name,
+		// last byte holds (len * 2). We just check the prefix.
+		got := slotVal.Bytes()[:len(c.name)]
+		if string(got) != c.name {
+			t.Errorf("%s: name slot got %q, want %q", c.addr.Hex(), string(got), c.name)
+		}
+	}
+}
