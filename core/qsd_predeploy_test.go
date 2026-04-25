@@ -118,38 +118,6 @@ func TestPredeployBytecodeIsNonEmpty(t *testing.T) {
 	}
 }
 
-// TestPredeployOwnerOverride verifies that the embedded sentinel
-// owner is rewritten to the caller-supplied OracleOwner at slot 0
-// of ValidatorOracle.
-func TestPredeployOwnerOverride(t *testing.T) {
-	const ownerSlot = "0x0000000000000000000000000000000000000000000000000000000000000000"
-
-	owner := common.BytesToAddress(common.FromHex("0xc0ffee0000000000000000000000000000000000"))
-	alloc := GenesisAlloc{}
-	AddQSDStabilityLayer(alloc, DefaultQSDPredeployParams(owner))
-
-	got := alloc[ValidatorOracleAddress].Storage[common.HexToHash(ownerSlot)]
-	wantAddr := common.BytesToAddress(got.Bytes())
-	if wantAddr != owner {
-		t.Errorf("oracle owner: got %s, want %s", wantAddr.Hex(), owner.Hex())
-	}
-
-	// And: a different owner threads through to a different slot value.
-	other := common.BytesToAddress(common.FromHex("0xbeef000000000000000000000000000000000000"))
-	alloc2 := GenesisAlloc{}
-	AddQSDStabilityLayer(alloc2, DefaultQSDPredeployParams(other))
-	got2 := alloc2[ValidatorOracleAddress].Storage[common.HexToHash(ownerSlot)]
-	if got == got2 {
-		t.Errorf("owner override is a no-op: same slot value for different owners (%s)", got.Hex())
-	}
-
-	// Sanity: the sentinel itself never leaks into the live alloc.
-	sentinelHash := common.BytesToHash(append(make([]byte, 12), PredeploySentinelOwner().Bytes()...))
-	if got == sentinelHash {
-		t.Errorf("alloc still has sentinel owner — override skipped")
-	}
-}
-
 // TestPredeployErc20MetadataPreserved verifies ERC-20 _name/_symbol
 // slots survived the dump → load round-trip. Slot 3 (name) and slot
 // 4 (symbol) are short strings stored as <data><len*2> for short

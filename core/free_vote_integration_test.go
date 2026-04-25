@@ -11,16 +11,38 @@ import (
 
 	"github.com/theQRL/go-qrl/common"
 	"github.com/theQRL/go-qrl/core/state"
+	"github.com/theQRL/go-qrl/crypto"
 )
 
-// registerValidator inserts `v` into ValidatorOracle's
-// validatorIndex mapping. The validators[] array storage is left
-// empty: submitVote() doesn't read it, and _updateCache iterates a
-// length-zero array harmlessly. Tests that depend on the median
-// being populated would also need to set the array.
-func registerValidator(sdb *state.StateDB, v common.Address) {
+// registerValidator faithfully mirrors what
+// ValidatorOracle.setValidatorSet does on a fresh add: appends `v`
+// to the validators[] dynamic array (slot 1 length + element at
+// keccak256(slot 1) + i) AND sets validatorIndex[v] to its 1-indexed
+// position. Without the array push, the oracle's median computation
+// would silently exclude this validator.
+func registerValidator(t *testing.T, sdb *state.StateDB, v common.Address) {
+	t.Helper()
+
+	// Read current array length.
+	lengthSlot := common.Hash{}
+	lengthSlot[31] = byte(validatorOracleValidatorsLengthSlot)
+	current := sdb.GetState(ValidatorOracleAddress, lengthSlot).Big().Uint64()
+
+	// Append: validators[current] at keccak256(slot 1) + current.
+	arrayBase := crypto.Keccak256Hash(common.LeftPadBytes(
+		big.NewInt(validatorOracleValidatorsLengthSlot).Bytes(), 32))
+	idxInt := new(big.Int).Add(new(big.Int).SetBytes(arrayBase.Bytes()), new(big.Int).SetUint64(current))
+	elemSlot := common.BytesToHash(common.LeftPadBytes(idxInt.Bytes(), 32))
+	sdb.SetState(ValidatorOracleAddress, elemSlot,
+		common.BytesToHash(common.LeftPadBytes(v.Bytes(), 32)))
+
+	// Bump length by 1.
+	sdb.SetState(ValidatorOracleAddress, lengthSlot,
+		common.BigToHash(new(big.Int).SetUint64(current+1)))
+
+	// Set validatorIndex[v] = current + 1 (1-indexed).
 	sdb.SetState(ValidatorOracleAddress, ValidatorIndexStorageSlot(v),
-		common.HexToHash("0x0000000000000000000000000000000000000000000000000000000000000001"))
+		common.BigToHash(new(big.Int).SetUint64(current+1)))
 }
 
 // buildSubmitVoteCalldata produces calldata for
@@ -46,7 +68,7 @@ func TestFreeVote_FirstVoteIsFree(t *testing.T) {
 	alice := common.BytesToAddress(common.FromHex("0x000000000000000000000000000000000000a11c"))
 
 	sdb := newPredeployedState(t, alice)
-	registerValidator(sdb, alice)
+	registerValidator(t, sdb, alice)
 
 	const gasLimit = 200_000
 	gasPrice := big.NewInt(1_000_000_000)
@@ -87,7 +109,7 @@ func TestFreeVote_SecondVoteSameBlock_IsPaid(t *testing.T) {
 	coinbase := common.BytesToAddress(common.FromHex("0x000000000000000000000000000000000000c01b"))
 
 	sdb := newPredeployedState(t, alice)
-	registerValidator(sdb, alice)
+	registerValidator(t, sdb, alice)
 
 	const gasLimit = 200_000
 	gasPrice := big.NewInt(1_000_000_000)
@@ -144,7 +166,7 @@ func TestFreeVote_WrongBlockReverts_Paid(t *testing.T) {
 	alice := common.BytesToAddress(common.FromHex("0x000000000000000000000000000000000000a11c"))
 
 	sdb := newPredeployedState(t, alice)
-	registerValidator(sdb, alice)
+	registerValidator(t, sdb, alice)
 
 	const gasLimit = 200_000
 	gasPrice := big.NewInt(1_000_000_000)
@@ -208,6 +230,64 @@ func TestFreeVote_NonValidator_Paid(t *testing.T) {
 	}
 }
 
+// TestFreeVote_VoteFedIntoOracleMedian verifies the end-to-end path
+// the chain relies on for fee-token pricing: a registered validator
+// submits a vote, and that vote shows up in the oracle's median —
+// which is what every paymaster-fairness comparison ultimately
+// reads. Catches the class of bug where the validators[] array and
+// the votes[] mapping fall out of sync (e.g. registerValidator
+// previously only wrote validatorIndex, leaving validators[] empty
+// and the vote orphaned).
+func TestFreeVote_VoteFedIntoOracleMedian(t *testing.T) {
+	alice := common.BytesToAddress(common.FromHex("0x000000000000000000000000000000000000a11c"))
+
+	sdb := newPredeployedState(t, alice)
+	registerValidator(t, sdb, alice)
+
+	const gasLimit = 200_000
+	gasPrice := big.NewInt(1_000_000_000)
+	fundNativeForGas(sdb, alice, gasLimit, gasPrice)
+
+	// Alice's intended vote — exactly the value we expect to read
+	// back out of the oracle's median.
+	want, _ := new(big.Int).SetString("1500000000000000000", 10) // $1.50
+
+	msg := &Message{
+		From:      alice,
+		To:        &ValidatorOracleAddress,
+		Nonce:     0,
+		Value:     big.NewInt(0),
+		GasLimit:  gasLimit,
+		GasPrice:  gasPrice,
+		GasFeeCap: gasPrice,
+		GasTipCap: gasPrice,
+		Data:      buildSubmitVoteCalldata(big.NewInt(1), want),
+	}
+
+	result := applyPaymasterMessage(t, sdb, msg, big.NewInt(0))
+	if result.Failed() {
+		t.Fatalf("submitVote failed: %v", result.Err)
+	}
+
+	// Sanity: alice's vote IS in storage at votes[alice].
+	voteSlot := sdb.GetState(ValidatorOracleAddress, ValidatorVoteStorageSlot(alice))
+	storedPrice := new(big.Int).SetBytes(voteSlot[16:32])
+	if storedPrice.Cmp(want) != 0 {
+		t.Fatalf("vote not stored: votes[alice] price=%s, want %s", storedPrice, want)
+	}
+
+	// And: the oracle's median — driven by iterating validators[] —
+	// reflects alice's vote. With the registerValidator helper now
+	// pushing into the array, this round-trips end-to-end.
+	got, healthy := ComputeOraclePrice(sdb, 1)
+	if !healthy {
+		t.Fatalf("oracle should be healthy with one fresh vote in a one-validator set")
+	}
+	if got.Cmp(want) != 0 {
+		t.Errorf("oracle median: got %s, want %s", got, want)
+	}
+}
+
 func TestFreeVote_NonSubmitVoteCallToOracle_Paid(t *testing.T) {
 	// A validator calling some non-submitVote function on the oracle
 	// (here: a function that doesn't exist, which falls through to
@@ -216,7 +296,7 @@ func TestFreeVote_NonSubmitVoteCallToOracle_Paid(t *testing.T) {
 	coinbase := common.BytesToAddress(common.FromHex("0x000000000000000000000000000000000000c01b"))
 
 	sdb := newPredeployedState(t, alice)
-	registerValidator(sdb, alice)
+	registerValidator(t, sdb, alice)
 
 	const gasLimit = 200_000
 	gasPrice := big.NewInt(1_000_000_000)

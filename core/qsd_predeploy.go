@@ -37,22 +37,24 @@ const (
 // against `cast sig` in tests.
 var SubmitVoteSelector = crypto.Keccak256([]byte("submitVote(uint256,uint256)"))[:4]
 
-// ValidatorOracle storage layout (from src/ValidatorOracle.sol):
+// ValidatorOracle storage layout (from src/ValidatorOracle.sol).
+// Since Ownable is no longer inherited, slot 0 is the validators
+// array length:
 //
-//   - slot 0: Ownable._owner
 //   - immutables (voteStalenessBlocks, minQuorum*) live in bytecode
-//   - slot 1: validators[] length
-//   - slot 2: validatorIndex[address] mapping
-//   - slot 3: votes[address] mapping (struct Vote { uint128 price; uint64 blockNumber; })
-//   - slot 4: cache (packed ViewCache)
+//   - slot 0: validators[] length
+//   - slot 1: validatorIndex[address] mapping
+//   - slot 2: votes[address] mapping (struct Vote { uint128 price; uint64 blockNumber; })
+//   - slot 3: cache (packed ViewCache)
 //
 // These slot constants drive the consensus-side read-paths used to
-// gate the free-validator-vote rule.
+// gate the free-validator-vote rule and to refresh the txpool's
+// paymaster-fairness factor.
 const (
-	validatorOracleValidatorsLengthSlot = 1
-	validatorOracleValidatorIndexSlot   = 2
-	validatorOracleVotesSlot            = 3
-	validatorOracleCacheSlot            = 4
+	validatorOracleValidatorsLengthSlot = 0
+	validatorOracleValidatorIndexSlot   = 1
+	validatorOracleVotesSlot            = 2
+	validatorOracleCacheSlot            = 3
 )
 
 // QSD Stability Layer: addresses reserved for the on-chain primitives
@@ -92,32 +94,21 @@ var (
 // QSDPredeployParams configures the genesis-time deployment of the
 // QSD stability layer.
 //
-// Only OracleOwner is run-time configurable. The voting parameters
+// Currently no run-time-configurable knobs: the voting parameters
 // (vote-staleness window, quorum fraction) are immutable in the
-// ValidatorOracle bytecode and are therefore baked into the
-// pre-dumped genesis state; changing them requires regenerating
-// qsd_predeploy_state.json from script/Predeploy.s.sol.
-type QSDPredeployParams struct {
-	// OracleOwner becomes the initial owner of ValidatorOracle. It can
-	// add and remove validators from the active set. In production
-	// this should be a multisig or governance contract.
-	OracleOwner common.Address
-}
+// ValidatorOracle bytecode and baked into the pre-dumped genesis
+// state; the validator set is consensus-driven via per-block system
+// calls so there is no owner to seed. The struct is kept for future
+// fields and to preserve the API shape.
+type QSDPredeployParams struct{}
 
-// DefaultQSDPredeployParams returns sensible defaults for a developer
-// network.
-func DefaultQSDPredeployParams(owner common.Address) QSDPredeployParams {
-	return QSDPredeployParams{
-		OracleOwner: owner,
-	}
+// DefaultQSDPredeployParams returns the predeploy params for a
+// developer network. The signature retains the (owner) parameter
+// for backwards source compatibility with callers that still thread
+// a "faucet" address through; the value is ignored.
+func DefaultQSDPredeployParams(_ common.Address) QSDPredeployParams {
+	return QSDPredeployParams{}
 }
-
-// predeploySentinelOwner is the placeholder address baked into
-// qsd_predeploy_state.json's owner slot. AddQSDStabilityLayer rewrites
-// it to the live network's chosen owner.
-//
-// Must match the OWNER default in script/Predeploy.s.sol.
-var predeploySentinelOwner = common.BytesToAddress(common.FromHex("0x0000000000000000000000000000000000000001"))
 
 //go:embed qsd_predeploy_state.json
 var qsdPredeployStateJSON []byte
@@ -132,7 +123,7 @@ type dumpedAccount struct {
 	Storage map[string]string `json:"storage"`
 }
 
-// AddQSDStabilityLayer registers the three QSD-stability-layer
+// AddQSDStabilityLayer registers the four QSD-stability-layer
 // contracts in the supplied GenesisAlloc, populated from the embedded
 // state dump produced by qsd-contracts/script/Predeploy.s.sol.
 //
@@ -140,14 +131,16 @@ type dumpedAccount struct {
 //
 //   - deployed bytecode for each contract (with all `immutable`s
 //     resolved to the reserved addresses);
-//   - ERC-20 _name and _symbol slots for InverseQRL and QSD;
-//   - a placeholder owner address in ValidatorOracle's _owner slot,
-//     which this function rewrites to params.OracleOwner.
+//   - ERC-20 _name and _symbol slots for InverseQRL and QSD.
 //
-// Storage slots not initialized by the constructor (e.g. ERC-7201
-// namespaced ReentrancyGuard._status) default to zero, which is
-// functionally equivalent to NOT_ENTERED for fresh contracts.
-func AddQSDStabilityLayer(alloc GenesisAlloc, params QSDPredeployParams) {
+// The validator set is consensus-driven (per-block system calls into
+// ValidatorOracle.setValidatorSet from the sentinel SYSTEM_CALLER
+// address), so there is no owner key or initial validator list to
+// seed at genesis. Storage slots not initialized by the constructor
+// (e.g. ERC-7201 namespaced ReentrancyGuard._status) default to
+// zero, which is functionally equivalent to NOT_ENTERED for fresh
+// contracts.
+func AddQSDStabilityLayer(alloc GenesisAlloc, _ QSDPredeployParams) {
 	dump, err := parseQSDPredeployDump()
 	if err != nil {
 		// The JSON is embedded at build time; an error here means the
@@ -176,8 +169,6 @@ func AddQSDStabilityLayer(alloc GenesisAlloc, params QSDPredeployParams) {
 		}
 		alloc[addr] = ga
 	}
-
-	overrideOracleOwner(alloc, params.OracleOwner)
 }
 
 // parseQSDPredeployDump unmarshals the embedded vm.dumpState JSON
@@ -217,36 +208,6 @@ func (a dumpedAccount) toGenesisAccount() (GenesisAccount, error) {
 		Balance: balance,
 		Nonce:   nonce.Uint64(),
 	}, nil
-}
-
-// overrideOracleOwner rewrites ValidatorOracle's slot-0 owner from
-// the dump's placeholder to the live network's chosen owner. Slot 0
-// is OZ Ownable's _owner field; ValidatorOracle has no other base
-// contracts with storage above Ownable.
-func overrideOracleOwner(alloc GenesisAlloc, owner common.Address) {
-	acct, ok := alloc[ValidatorOracleAddress]
-	if !ok {
-		return
-	}
-	if acct.Storage == nil {
-		acct.Storage = make(map[common.Hash]common.Hash)
-	}
-	const ownerSlot = "0x0000000000000000000000000000000000000000000000000000000000000000"
-
-	// The address is right-aligned in the 32-byte slot. Build the slot
-	// value as 12 zero bytes followed by the 20-byte address.
-	var ownerHash common.Hash
-	copy(ownerHash[12:], owner.Bytes())
-	acct.Storage[common.HexToHash(ownerSlot)] = ownerHash
-	alloc[ValidatorOracleAddress] = acct
-}
-
-// PredeploySentinelOwner is the placeholder owner address embedded
-// in qsd_predeploy_state.json. Exposed for tests that need to
-// distinguish "the dump was loaded but the owner override was not
-// applied" from "the dump was never loaded".
-func PredeploySentinelOwner() common.Address {
-	return predeploySentinelOwner
 }
 
 // ValidatorIndexStorageSlot returns the storage slot in

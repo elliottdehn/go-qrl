@@ -97,13 +97,29 @@ gas itself can be paid in iQRL indefinitely.
 ## Genesis pre-deploy
 
 `AddQSDStabilityLayer(alloc, params)` registers the four addresses
-in a `GenesisAlloc`. The dev-genesis path (`DeveloperGenesisBlock`)
-calls it with `DefaultQSDPredeployParams(faucet)`.
+in a `GenesisAlloc`. `QSDPredeployParams` currently has no fields:
+the validator set is consensus-driven (see "Validator set source"
+below) and the voting parameters are baked into bytecode.
 
-The only run-time-configurable parameter is `OracleOwner`. Voting
-parameters (`voteStalenessBlocks`, `minQuorumNumerator`,
+Voting parameters (`voteStalenessBlocks`, `minQuorumNumerator`,
 `minQuorumDenominator`) are immutable in the ValidatorOracle
-bytecode and therefore baked into the genesis-state dump.
+bytecode and therefore frozen into the genesis-state dump; changing
+them requires regenerating that dump.
+
+### Validator set source
+
+The oracle's validator set is **the chain's PoS validator set**.
+On every block, the consensus engine system-calls
+`ValidatorOracle.setValidatorSet(addresses[])` from the sentinel
+sender `0xff..fe`, mirroring the active beacon validators (by
+withdrawal address) into EVM storage. The contract has no admin
+or owner key — there's nothing to govern manually.
+
+The diff is computed inside the contract: addresses present in
+the new set but missing from `validators[]` are appended; current
+validators not in the new set are removed via swap-and-pop with
+their `votes[]` entry deleted; addresses common to both keep their
+existing vote.
 
 ### State source
 
@@ -117,18 +133,13 @@ Bytecode and post-construction storage are baked into the embedded
      the on-chain instances;
   3. dumps the resulting state via `vm.dumpState`.
 
-To regenerate (after a contract change or to rotate the immutable
-voting parameters):
+To regenerate (after a contract change):
 
 ```
 cd qsd-contracts
-OWNER=0x0000000000000000000000000000000000000001 \
-    forge script script/Predeploy.s.sol --tc PredeployScript -vv
+forge script script/Predeploy.s.sol --tc PredeployScript -vv
 cp out/qsd-genesis-state.json ../go-qrl/core/qsd_predeploy_state.json
 ```
-
-`AddQSDStabilityLayer` rewrites the dump's placeholder owner with
-`params.OracleOwner` at slot 0 of ValidatorOracle.
 
 ## Validator daemon
 
@@ -165,6 +176,11 @@ depends on later ones.
 
 ## Open work
 
+  - **Consensus → setValidatorSet bridge.** The contract surface
+    and on-chain semantics are final, but the engine call site in
+    `consensus/beacon/` is not yet wired. Until it is, no real
+    network can drive the oracle's validator set. Dev networks can
+    drive it manually by pranking the sentinel sender in tests.
   - **Wallet / SDK support** for constructing type-0x04 txs. The
     chain accepts them via `eth_sendRawTransaction` and the JSON
     wire format is documented; client-side tooling that builds and

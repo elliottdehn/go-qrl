@@ -13,13 +13,13 @@ operation see [`cmd/qsdfeeder/README.md`](../cmd/qsdfeeder/README.md).
   - go-qrl built from a commit that includes the stability layer
     (branch `qsd-stability-layer` or descendants). All four
     predeploys must be present in genesis.
-  - A funded oracle-owner account. In dev-genesis this is the
-    faucet; in production it should be a multisig or governance
-    contract that can be rotated without redeploying the chain.
-  - One or more validator accounts, each holding enough native QRL
-    to cover the buyGas pre-charge for one vote tx. The free-vote
+  - One or more PoS validator accounts active in the chain's
+    beacon set. The oracle's validator set is mirrored from beacon
+    automatically — there is no separate registration step.
+  - Each validator needs a small native-QRL working balance to
+    cover the buyGas pre-charge for one vote tx. The free-vote
     rule refunds the entire fee, so the steady-state cost is zero —
-    a few QRL per validator is plenty as a working buffer.
+    a few QRL per validator is plenty as a buffer.
 
 ## 1. Genesis
 
@@ -32,7 +32,7 @@ import "github.com/theQRL/go-qrl/core"
 alloc := core.GenesisAlloc{
     // ... your network's account allocations ...
 }
-core.AddQSDStabilityLayer(alloc, core.DefaultQSDPredeployParams(oracleOwner))
+core.AddQSDStabilityLayer(alloc, core.QSDPredeployParams{})
 
 genesis := &core.Genesis{
     Config: chainConfig,
@@ -41,9 +41,9 @@ genesis := &core.Genesis{
 }
 ```
 
-`oracleOwner` is the address that will be authorised to add and
-remove validators on `ValidatorOracle`. See section 5 for the
-rotation procedure.
+`QSDPredeployParams` currently has no fields — the validator set
+is consensus-driven and the voting parameters are baked into
+bytecode at dump time.
 
 The voting parameters (`OracleVoteStalenessBlocks`,
 `OracleMinQuorumNumerator`, `OracleMinQuorumDenominator`) are
@@ -54,8 +54,7 @@ need different values, regenerate the genesis dump:
 ```sh
 cd qsd-contracts
 # Edit script/Predeploy.s.sol VOTE_STALENESS_BLOCKS / MIN_QUORUM_*
-OWNER=0x0000000000000000000000000000000000000001 \
-    forge script script/Predeploy.s.sol --tc PredeployScript -vv
+forge script script/Predeploy.s.sol --tc PredeployScript -vv
 cp out/qsd-genesis-state.json ../go-qrl/core/qsd_predeploy_state.json
 ```
 
@@ -91,22 +90,25 @@ at process-start time.
 
 ## 3. Validator registration
 
-The oracle owner adds each validator to the active set via the
-`addValidator(address)` call on `ValidatorOracle`:
+Validators are **registered automatically** by the consensus engine
+— there is no manual registration step. On every block, the beacon
+engine system-calls `ValidatorOracle.setValidatorSet(addresses[])`
+from the sentinel `0xff..fe` sender, mirroring the chain's active
+PoS validator set into EVM storage. A validator's withdrawal
+address is its identity on the oracle.
 
-```sh
-cast send 0x0000000000000000000000000000000000010000 \
-    "addValidator(address)" 0x<validator-address> \
-    --private-key $OWNER_KEY --rpc-url http://localhost:8545
-```
+A new validator becomes able to vote on the next block after they
+become active in the beacon set. They become "fresh" — contributing
+to the median and the `healthy()` quorum — as soon as they post
+their first vote within the last `voteStalenessBlocks` blocks.
 
-Removal is symmetric (`removeValidator(address)`); the oracle
-swap-and-pops without a length-bound failure mode for sets up to
-`MAX_VALIDATORS = 100`.
-
-A validator becomes "fresh" — and starts contributing to the
-oracle's median + healthy() quorum — as soon as it has submitted
-its first vote within the last `voteStalenessBlocks` blocks.
+**Open caveat**: at the moment of writing this runbook, the
+consensus → setValidatorSet bridge is not yet wired in
+`consensus/beacon/`. The contract surface and on-chain semantics
+are final; the engine call site is the remaining piece. Until that
+ships, dev-network operators can drive the system call manually
+(e.g. via a small test fixture that pranks `0xff..fe`) — but no
+real network should run without the bridge.
 
 ## 4. Running the price feeder
 
@@ -146,23 +148,7 @@ When `--keystore` is empty the daemon falls back to a stub
 submitter that only logs what it would have sent — useful for
 smoke-testing infrastructure plumbing without provisioning a key.
 
-## 5. Owner rotation
-
-Transferring oracle ownership uses OpenZeppelin Ownable's
-`transferOwnership(address)`:
-
-```sh
-cast send 0x0000000000000000000000000000000000010000 \
-    "transferOwnership(address)" 0x<new-owner> \
-    --private-key $CURRENT_OWNER_KEY --rpc-url http://localhost:8545
-```
-
-Production deployments should rotate the genesis-time owner (often
-a single-signer faucet) to a multisig or a governance contract
-within the first epoch. Until that happens, a single key compromise
-is sufficient to rewrite the validator set.
-
-## 6. Monitoring
+## 5. Monitoring
 
 Metrics to track per validator:
 
@@ -188,7 +174,7 @@ Metrics to track per oracle:
     receiving paymaster fees in iQRL accumulate it; monitoring
     this gives a feel for paymaster usage.
 
-## 7. The first user transaction
+## 6. The first user transaction
 
 A new account on the chain can use the paymaster only after it has
 acquired iQRL **and** approved the paymaster contract. The
@@ -208,7 +194,7 @@ practical first-tx flow for any user:
 A clean wallet UX bundles steps 2 and 3 into the user's onboarding
 flow so it feels like one interaction.
 
-## 8. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
@@ -219,7 +205,7 @@ flow so it feels like one interaction.
 | Paymaster tx admitted but reverts at execution | Allowance dropped between admission and execution | Re-approve, or set unlimited approval |
 | Paymaster contract balance non-zero between blocks | Settle path failed mid-execution; investigate | File a bug — should never happen |
 
-## 9. Open work
+## 8. Open work
 
 These known gaps are tracked in
 [`qsd-stability-layer.md`](qsd-stability-layer.md) §"Open work":
