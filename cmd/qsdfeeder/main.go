@@ -6,11 +6,11 @@
 // qsdfeeder is a validator-side daemon that periodically posts a
 // QRL/USD price vote to the on-chain ValidatorOracle contract.
 //
-// Status: scaffolding. The submission path is currently a stub that
-// only logs what it would send. Real wallet signing + RPC dispatch
-// will land in the next commit; this scaffold pins down flag/config
-// surface, the price-source interface, and the run loop so the next
-// change is purely additive.
+// When --keystore is provided, the daemon decrypts the wallet,
+// connects to the RPC endpoint, and broadcasts real signed
+// transactions. When --keystore is empty, it falls back to a stub
+// submitter that only logs what it would send — useful for smoke
+// tests and dev networks where you only care about price discovery.
 //
 // Usage:
 //
@@ -19,7 +19,9 @@
 //	    --oracle=Q0000000000000000000000000000000000010000 \
 //	    --interval=30s \
 //	    --price-source=static \
-//	    --static-price=1.00
+//	    --static-price=1.00 \
+//	    --keystore=/etc/qrl/validator.json \
+//	    --password-file=/etc/qrl/validator.pass
 package main
 
 import (
@@ -27,14 +29,17 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/theQRL/go-qrl/accounts/keystore"
 	"github.com/theQRL/go-qrl/common"
 	"github.com/theQRL/go-qrl/core"
+	"github.com/theQRL/go-qrl/qrlclient"
 )
 
 type config struct {
@@ -45,6 +50,7 @@ type config struct {
 	staticPrice  string
 	chainID      int64
 	keystorePath string
+	passwordFile string
 	verbose      bool
 }
 
@@ -64,10 +70,61 @@ func parseFlags() *config {
 	flag.Int64Var(&c.chainID, "chain-id", 0,
 		"chain ID for tx signing (auto-detected from RPC when 0)")
 	flag.StringVar(&c.keystorePath, "keystore", "",
-		"path to validator keystore (TODO: not yet wired)")
+		"path to validator keystore JSON; empty means stub-submitter (logs only)")
+	flag.StringVar(&c.passwordFile, "password-file", "",
+		"path to file containing the keystore passphrase (required when --keystore is set)")
 	flag.BoolVar(&c.verbose, "v", false, "verbose logging")
 	flag.Parse()
 	return c
+}
+
+// loadKeyedSubmitter handles the keystore-backed submission path:
+// decrypt the wallet, dial the RPC, resolve the chain ID, and return
+// a fully-wired VoteSubmitter. The returned closeFn must be called by
+// the caller on shutdown to release the RPC connection.
+func loadKeyedSubmitter(
+	ctx context.Context,
+	c *config,
+	oracle common.Address,
+	logf func(format string, args ...any),
+) (VoteSubmitter, func(), error) {
+	if c.passwordFile == "" {
+		return nil, nil, fmt.Errorf("--password-file is required when --keystore is set")
+	}
+	keyJSON, err := os.ReadFile(c.keystorePath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read keystore: %w", err)
+	}
+	password, err := os.ReadFile(c.passwordFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read password file: %w", err)
+	}
+	key, err := keystore.DecryptKey(keyJSON, strings.TrimRight(string(password), "\r\n"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("decrypt keystore: %w", err)
+	}
+
+	client, err := qrlclient.DialContext(ctx, c.rpcURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dial rpc: %w", err)
+	}
+
+	chainID := big.NewInt(c.chainID)
+	if c.chainID == 0 {
+		chainID, err = client.ChainID(ctx)
+		if err != nil {
+			client.Close()
+			return nil, nil, fmt.Errorf("auto-detect chain id: %w", err)
+		}
+	}
+	logf("loaded validator key: address=%s chain_id=%s", key.Address.Hex(), chainID.String())
+
+	sub, err := NewKeyedSubmitter(client, key.Wallet, chainID, oracle, logf)
+	if err != nil {
+		client.Close()
+		return nil, nil, fmt.Errorf("build keyed submitter: %w", err)
+	}
+	return sub, client.Close, nil
 }
 
 func buildPriceSource(c *config) (PriceSource, error) {
@@ -115,19 +172,27 @@ func main() {
 		logger.Fatalf("build price source: %v", err)
 	}
 
+	// Graceful shutdown on SIGINT / SIGTERM.
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	var submitter VoteSubmitter
 	if c.keystorePath == "" {
 		logger.Print("WARN keystore not configured — running with stub submitter (logs only)")
+		submitter = NewStubSubmitter(oracle, logf)
+	} else {
+		sub, closeFn, err := loadKeyedSubmitter(ctx, c, oracle, logf)
+		if err != nil {
+			logger.Fatalf("load keyed submitter: %v", err)
+		}
+		defer closeFn()
+		submitter = sub
 	}
-	submitter := NewStubSubmitter(oracle, logf)
 
 	feeder, err := NewFeeder(source, submitter, c.interval, logf)
 	if err != nil {
 		logger.Fatalf("build feeder: %v", err)
 	}
-
-	// Graceful shutdown on SIGINT / SIGTERM.
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 
 	if err := feeder.Run(ctx); err != nil {
 		logger.Fatalf("feeder: %v", err)

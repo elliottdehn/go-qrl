@@ -77,8 +77,14 @@ until the bytecode is baked in.
 ## Validator daemon
 
 Validators run `qsdfeeder` to post price votes to `ValidatorOracle`
-on a configurable cadence. See [`cmd/qsdfeeder/README.md`](../cmd/qsdfeeder/README.md)
-for build and operation.
+on a configurable cadence. With `--keystore` and `--password-file`
+set the daemon decrypts the wallet, signs an EIP-1559 transaction
+calling `submitVote(uint256)`, and broadcasts it via
+`qrl_sendRawTransaction`. Without those flags it falls back to a
+stub submitter that only logs — useful for testing price discovery
+without provisioning a key. See
+[`cmd/qsdfeeder/README.md`](../cmd/qsdfeeder/README.md) for build
+and operation.
 
 The vote calldata is `submitVote(uint256)` — selector `0x2844328f`,
 followed by the price as a 32-byte big-endian uint256, scaled by
@@ -86,13 +92,17 @@ followed by the price as a 32-byte big-endian uint256, scaled by
 
 ## Roadmap
 
-The branch `qsd-stability-layer` lands the layer in three additive
-commits:
+The branch `qsd-stability-layer` lands the layer in additive commits:
 
-1. **Genesis pre-deploy** — reserves the three addresses (this commit).
-2. **Validator daemon** — `cmd/qsdfeeder` with a stub submitter.
-3. **Real submitter + bytecode bake** — wallet-signed transactions and
-   populated `GenesisAccount{Code, Storage}` from the Foundry build.
+1. **Genesis pre-deploy** — reserves the three addresses. ✅
+2. **Validator daemon scaffold** — `cmd/qsdfeeder` with a stub
+   submitter so price discovery can be smoke-tested without a
+   wallet. ✅
+3. **Real submitter** — keystore-backed, EIP-1559, post-quantum
+   signed transactions sent via `qrlclient`. ✅
+4. **Bytecode bake** — populate `GenesisAccount{Code, Storage}` for
+   the three addresses from the Foundry build, replacing the empty
+   placeholders. ⏳
 
 Each step is independently testable; nothing in earlier steps depends
 on later ones.

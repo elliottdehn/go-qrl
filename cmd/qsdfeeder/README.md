@@ -9,10 +9,15 @@ For protocol context see [`docs/qsd-stability-layer.md`](../../docs/qsd-stabilit
 
 # Status
 
-The current binary is a **runnable scaffold**. The submission path is
-a stub that only logs what it would send; real wallet signing and RPC
-dispatch land in a follow-up commit. Flag surface, the price-source
-interface, and the run loop are stable.
+Two submission modes:
+
+  - **Keyed** — when `--keystore` is set, the daemon decrypts the wallet,
+    dials the RPC endpoint, builds an EIP-1559 transaction calling
+    `submitVote(uint256)` on the oracle, signs with the wallet's
+    post-quantum key, and broadcasts via `qrl_sendRawTransaction`.
+  - **Stub** — when `--keystore` is empty, the daemon only logs what it
+    would have submitted. Useful for smoke-testing price discovery on
+    a dev network without provisioning a validator key.
 
 
 # Build
@@ -24,17 +29,31 @@ go build ./cmd/qsdfeeder
 
 # Usage
 
+Stub mode (no transactions, logs only):
+
 ```
 qsdfeeder \
     --rpc=http://127.0.0.1:8545 \
-    --oracle=Q0000000000000000000000000000000000010000 \
     --interval=30s \
     --price-source=static \
     --static-price=1.00
 ```
 
+Keyed mode (real signed transactions):
+
+```
+qsdfeeder \
+    --rpc=http://127.0.0.1:8545 \
+    --interval=30s \
+    --price-source=static \
+    --static-price=1.00 \
+    --keystore=/etc/qrl/validator.json \
+    --password-file=/etc/qrl/validator.pass
+```
+
 The default `--oracle` is `core.ValidatorOracleAddress`, so on a
-dev-genesis node it can be omitted.
+dev-genesis node it can be omitted. Chain ID is auto-detected from
+the RPC endpoint when `--chain-id=0` (the default).
 
 
 ## Flags
@@ -47,7 +66,8 @@ dev-genesis node it can be omitted.
 | `--price-source` | `static`                 | Only `static` is implemented. |
 | `--static-price` | `1.00`                   | USD per QRL when source is `static`. |
 | `--chain-id`     | `0`                      | `0` means auto-detect from RPC. |
-| `--keystore`     | (empty)                  | Reserved; not yet wired. |
+| `--keystore`     | (empty)                  | Path to validator keystore JSON. Empty selects stub submitter. |
+| `--password-file`| (empty)                  | Required when `--keystore` is set. Trailing newlines are stripped. |
 | `-v`             | `false`                  | Verbose logging. |
 
 
@@ -60,6 +80,10 @@ wait a full interval), then on the configured ticker. Each cycle:
 2. Encode `submitVote(uint256)` calldata against the price scaled
    to `1e18`.
 3. Hand it to the configured `VoteSubmitter`.
+
+In keyed mode each cycle additionally fetches the pending nonce, the
+latest base fee, and a tip-cap suggestion from the RPC, and adds 20%
+gas headroom on top of the `EstimateGas` result.
 
 Transient errors are logged and the loop continues. `SIGINT` /
 `SIGTERM` drains the loop and exits cleanly.
