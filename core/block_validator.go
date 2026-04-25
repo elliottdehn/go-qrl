@@ -76,6 +76,17 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 		return errors.New("withdrawals present in block body")
 	}
 
+	// ValidatorsHash binds the body's Validators slice to the header.
+	// Same nil / empty / populated shape as WithdrawalsHash.
+	if header.ValidatorsHash != nil {
+		validators := types.Validators(block.Validators())
+		if hash := types.DeriveSha(validators, trie.NewStackTrie(nil)); hash != *header.ValidatorsHash {
+			return fmt.Errorf("validators root hash mismatch (header value %x, calculated %x)", *header.ValidatorsHash, hash)
+		}
+	} else if len(block.Validators()) > 0 {
+		return errors.New("validators present in block body but not committed to in header")
+	}
+
 	// Ancestor block must be known.
 	if !v.bc.HasBlockAndState(block.ParentHash(), block.NumberU64()-1) {
 		if !v.bc.HasBlock(block.ParentHash(), block.NumberU64()-1) {

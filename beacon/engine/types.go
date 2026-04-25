@@ -202,6 +202,13 @@ func ExecutableDataToBlockNoHash(data ExecutableData) (*types.Block, error) {
 		h := types.DeriveSha(types.Withdrawals(data.Withdrawals), trie.NewStackTrie(nil))
 		withdrawalsRoot = &h
 	}
+	// Same shape for validators: nil → no commitment, empty slice
+	// → EmptyValidatorsHash, populated → trie root.
+	var validatorsRoot *common.Hash
+	if data.Validators != nil {
+		h := types.DeriveSha(types.Validators(data.Validators), trie.NewStackTrie(nil))
+		validatorsRoot = &h
+	}
 	header := &types.Header{
 		ParentHash:      data.ParentHash,
 		Coinbase:        data.FeeRecipient,
@@ -217,6 +224,7 @@ func ExecutableDataToBlockNoHash(data ExecutableData) (*types.Block, error) {
 		Extra:           data.ExtraData,
 		Random:          data.Random,
 		WithdrawalsHash: withdrawalsRoot,
+		ValidatorsHash:  validatorsRoot,
 	}
 	return types.NewBlockWithHeader(header).
 			WithBody(types.Body{

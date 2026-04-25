@@ -50,6 +50,12 @@ type Header struct {
 	Random          common.Hash    `json:"prevRandao"`
 	BaseFee         *big.Int       `json:"baseFeePerGas"`
 	WithdrawalsHash *common.Hash   `json:"withdrawalsRoot"`
+
+	// ValidatorsHash commits to the active PoS validator set carried
+	// in the block body (Body.Validators). nil means no commitment
+	// was made — typically only in pre-stability-layer blocks.
+	// EmptyValidatorsHash means an explicit empty set.
+	ValidatorsHash *common.Hash `json:"validatorsRoot" rlp:"optional"`
 }
 
 // field type overrides for gencodec
@@ -101,12 +107,13 @@ func (h *Header) SanityCheck() error {
 }
 
 // EmptyBody returns true if there is no additional 'body' to complete the header
-// that is: no transactions and no withdrawals.
+// that is: no transactions, no withdrawals, and no validator set.
 func (h *Header) EmptyBody() bool {
 	var (
 		emptyWithdrawals = h.WithdrawalsHash == nil || *h.WithdrawalsHash == EmptyWithdrawalsHash
+		emptyValidators  = h.ValidatorsHash == nil || *h.ValidatorsHash == EmptyValidatorsHash
 	)
-	return h.TxHash == EmptyTxsHash && emptyWithdrawals
+	return h.TxHash == EmptyTxsHash && emptyWithdrawals && emptyValidators
 }
 
 // EmptyReceipts returns true if there are no receipts for this header/block.
@@ -216,10 +223,17 @@ func NewBlock(header *Header, body *Body, receipts []*Receipt, hasher TrieHasher
 		b.withdrawals = slices.Clone(withdrawals)
 	}
 
-	// Validators are not currently committed to the header. A future
-	// commit will add a ValidatorsHash field for full block-level
-	// authentication; for now the field is body-only.
-	if len(validators) > 0 {
+	// Compute ValidatorsHash from the body. nil → no commitment;
+	// empty slice → EmptyValidatorsHash sentinel; non-empty →
+	// Merkle-trie root over RLP-encoded addresses.
+	if validators == nil {
+		b.header.ValidatorsHash = nil
+	} else if len(validators) == 0 {
+		b.header.ValidatorsHash = &EmptyValidatorsHash
+		b.validators = []common.Address{}
+	} else {
+		hash := DeriveSha(Validators(validators), hasher)
+		b.header.ValidatorsHash = &hash
 		b.validators = slices.Clone(validators)
 	}
 
@@ -242,6 +256,10 @@ func CopyHeader(h *Header) *Header {
 	if h.WithdrawalsHash != nil {
 		cpy.WithdrawalsHash = new(common.Hash)
 		*cpy.WithdrawalsHash = *h.WithdrawalsHash
+	}
+	if h.ValidatorsHash != nil {
+		cpy.ValidatorsHash = new(common.Hash)
+		*cpy.ValidatorsHash = *h.ValidatorsHash
 	}
 	return &cpy
 }

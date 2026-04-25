@@ -115,13 +115,12 @@ the old is added; anything in the old but not the new is removed
 and its `votes[]` entry deleted. Validators present in both keep
 their existing vote.
 
-**Open caveat**: the body's `Validators` field is not yet
-header-committed (no `ValidatorsHash` in the header). A block
-proposer could theoretically serve different validator sets to
-different peers and a non-block-proposer node has no compact way
-to verify which is canonical. Production networks should land
-the header commitment before depending on this for security-
-critical behaviour.
+The body's `Validators` field is committed to in the header via
+`ValidatorsHash` — same shape as `WithdrawalsHash` for
+withdrawals: `nil` for no commitment, `EmptyValidatorsHash` for
+an explicit empty set, otherwise a Merkle-trie root over the
+RLP-encoded addresses. The block validator rejects any block
+whose body `Validators` doesn't hash to the header value.
 
 ## 4. Running the price feeder
 

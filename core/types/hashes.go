@@ -37,6 +37,9 @@ var (
 
 	// EmptyWithdrawalsHash is the known hash of the empty withdrawal set.
 	EmptyWithdrawalsHash = common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
+
+	// EmptyValidatorsHash is the known hash of the empty validator set.
+	EmptyValidatorsHash = common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
 )
 
 // TrieRootHash returns the hash itself if it's non-empty or the predefined
