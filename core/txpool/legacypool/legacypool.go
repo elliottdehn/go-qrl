@@ -1422,6 +1422,58 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 	log.Debug("Reinjecting stale transactions", "count", len(reinject))
 	core.SenderCacher.Recover(pool.signer, reinject)
 	pool.addTxsLocked(reinject, false)
+
+	// Evict submitVote() txs whose target block has already been
+	// produced. The strict-block check on ValidatorOracle guarantees
+	// they would revert (WrongBlockNumber) on inclusion, so keeping
+	// them around just wastes propagation bandwidth and validator gas.
+	pool.evictStaleVotes(newHead.Number.Uint64())
+}
+
+// evictStaleVotes removes any submitVote() tx whose target
+// forBlockNumber is <= the latest-mined block. Such a tx can never
+// successfully execute again (the contract enforces forBlockNumber
+// == block.number, and block.number only grows).
+func (pool *LegacyPool) evictStaleVotes(latestMined uint64) {
+	var stale []common.Hash
+	pool.all.Range(func(hash common.Hash, tx *types.Transaction, _ bool) bool {
+		if forBlock, ok := submitVoteTargetBlock(tx); ok && forBlock <= latestMined {
+			stale = append(stale, hash)
+		}
+		return true
+	}, true, true)
+
+	for _, hash := range stale {
+		pool.removeTx(hash, true, true)
+	}
+	if len(stale) > 0 {
+		log.Debug("Evicted stale validator vote txs", "count", len(stale), "head", latestMined)
+	}
+}
+
+// submitVoteTargetBlock decodes the forBlockNumber argument out of a
+// submitVote(uint256,uint256) calldata payload, if `tx` is in fact
+// a submitVote tx aimed at the ValidatorOracle. The bool reports
+// whether the tx matches.
+func submitVoteTargetBlock(tx *types.Transaction) (uint64, bool) {
+	to := tx.To()
+	if to == nil || *to != core.ValidatorOracleAddress {
+		return 0, false
+	}
+	data := tx.Data()
+	if len(data) < 4+32+32 {
+		return 0, false
+	}
+	for i := 0; i < 4; i++ {
+		if data[i] != core.SubmitVoteSelector[i] {
+			return 0, false
+		}
+	}
+	// First arg occupies bytes [4, 36); big-endian uint256. We only
+	// care about the low 64 bits — anything larger can't possibly
+	// equal a real block.number, so it's stale by definition (and
+	// will be evicted next reset anyway).
+	return new(big.Int).SetBytes(data[4:36]).Uint64(), true
 }
 
 // promoteExecutables moves transactions that have become processable from the
