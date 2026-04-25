@@ -87,6 +87,12 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 		return errors.New("validators present in block body but not committed to in header")
 	}
 
+	// Vote-ordering rule: all price-vote txs come before any
+	// non-vote tx. See validateVoteOrdering for the exact predicate.
+	if err := validateVoteOrdering(block.Transactions()); err != nil {
+		return err
+	}
+
 	// Ancestor block must be known.
 	if !v.bc.HasBlockAndState(block.ParentHash(), block.NumberU64()-1) {
 		if !v.bc.HasBlock(block.ParentHash(), block.NumberU64()-1) {
@@ -141,4 +147,29 @@ func CalcGasLimit(parentGasLimit, desiredLimit uint64) uint64 {
 		limit = max(parentGasLimit-delta, desiredLimit)
 	}
 	return limit
+}
+
+// validateVoteOrdering enforces the "price votes first" rule: in
+// any block, every submitVote tx (call to the ValidatorOracle
+// predeploy with the submitVote selector) must come before every
+// non-vote tx. Returns nil when the ordering holds.
+//
+// Why: this guarantees the on-chain oracle's per-block median is
+// finalized by the time any non-vote tx in the same block runs.
+// Paymaster fee splits, QSD.redeem, InverseQRL.mint, etc. all read
+// oracle.price() / .healthy() — without the ordering, they could
+// see a stale median when they execute and a fresh one when a
+// later in-block submitVote moves it.
+func validateVoteOrdering(txs []*types.Transaction) error {
+	sawNonVote := false
+	for i, tx := range txs {
+		if IsSubmitVoteTx(tx) {
+			if sawNonVote {
+				return fmt.Errorf("vote ordering: tx %d is a submitVote but a non-vote tx already preceded it", i)
+			}
+		} else {
+			sawNonVote = true
+		}
+	}
+	return nil
 }

@@ -287,6 +287,32 @@ func VoteBlockNumberFromSlot(slot common.Hash) uint64 {
 	return n
 }
 
+// IsSubmitVoteTx reports whether `tx` is a `submitVote(uint256,uint256)`
+// call to the ValidatorOracle predeploy. Used to enforce the
+// "all price votes come first" block-ordering rule (see
+// core/block_validator.go) and for txpool eviction of stale-target
+// votes. The check is purely on (To, calldata selector); the
+// caller is responsible for any per-tx authentication.
+func IsSubmitVoteTx(tx interface {
+	To() *common.Address
+	Data() []byte
+}) bool {
+	to := tx.To()
+	if to == nil || *to != ValidatorOracleAddress {
+		return false
+	}
+	data := tx.Data()
+	if len(data) < 4 {
+		return false
+	}
+	for i := 0; i < 4; i++ {
+		if data[i] != SubmitVoteSelector[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // mappingSlot computes the storage slot of mapping[key], where the
 // mapping is declared at the given top-level slot. Uses the standard
 // Solidity layout: keccak256(leftPad(key, 32) || leftPad(slot, 32)).

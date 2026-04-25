@@ -303,20 +303,86 @@ func (miner *Miner) fillTransactions(interrupt *atomic.Int32, env *environment) 
 			localTxs[account] = txs
 		}
 	}
-	// Fill the block with all available pending transactions.
-	if len(localTxs) > 0 {
-		txs := newTransactionsByPriceAndNonce(env.signer, localTxs, env.header.BaseFee)
+
+	// First, partition out price-vote txs (submitVote → oracle).
+	// They must land at the start of the block per the vote-ordering
+	// rule enforced by ValidateBody — committing them ahead of all
+	// other txs ensures we don't accidentally produce an invalid
+	// block. partitionVoteTxs preserves per-account nonce order.
+	localVotes, localOther := partitionVoteTxs(localTxs)
+	remoteVotes, remoteOther := partitionVoteTxs(remoteTxs)
+
+	// Fill votes first.
+	if len(localVotes) > 0 {
+		txs := newTransactionsByPriceAndNonce(env.signer, localVotes, env.header.BaseFee)
 		if err := miner.commitTransactions(env, txs, interrupt); err != nil {
 			return err
 		}
 	}
-	if len(remoteTxs) > 0 {
-		txs := newTransactionsByPriceAndNonce(env.signer, remoteTxs, env.header.BaseFee)
+	if len(remoteVotes) > 0 {
+		txs := newTransactionsByPriceAndNonce(env.signer, remoteVotes, env.header.BaseFee)
+		if err := miner.commitTransactions(env, txs, interrupt); err != nil {
+			return err
+		}
+	}
+	// Then everything else.
+	if len(localOther) > 0 {
+		txs := newTransactionsByPriceAndNonce(env.signer, localOther, env.header.BaseFee)
+		if err := miner.commitTransactions(env, txs, interrupt); err != nil {
+			return err
+		}
+	}
+	if len(remoteOther) > 0 {
+		txs := newTransactionsByPriceAndNonce(env.signer, remoteOther, env.header.BaseFee)
 		if err := miner.commitTransactions(env, txs, interrupt); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// partitionVoteTxs splits a per-account pending-tx map into
+// (votes, other), preserving nonce order within each account.
+//
+//   - Leading vote txs (lowest nonces) go into `votes`.
+//   - The remainder goes into `other`, BUT truncated at the first
+//     vote encountered. A vote in the middle of an account's queue
+//     can't be included in this block (committing it after a non-
+//     vote would violate the ordering rule, and skipping it would
+//     create a nonce gap), so everything from that point onward is
+//     deferred to a future block. The skipped txs stay in the
+//     pool; once the leading non-votes mine, the vote is at the
+//     head of the queue and partitions correctly next round.
+func partitionVoteTxs(in map[common.Address][]*txpool.LazyTransaction) (votes, other map[common.Address][]*txpool.LazyTransaction) {
+	votes = make(map[common.Address][]*txpool.LazyTransaction)
+	other = make(map[common.Address][]*txpool.LazyTransaction)
+	for addr, txs := range in {
+		// Count leading votes.
+		split := 0
+		for _, lt := range txs {
+			if lt.Tx == nil || !core.IsSubmitVoteTx(lt.Tx) {
+				break
+			}
+			split++
+		}
+		if split > 0 {
+			votes[addr] = txs[:split]
+		}
+		// Take non-votes after the leading votes, stopping at the
+		// next vote. Anything past that point is held back for a
+		// later block.
+		end := split
+		for end < len(txs) {
+			if txs[end].Tx != nil && core.IsSubmitVoteTx(txs[end].Tx) {
+				break
+			}
+			end++
+		}
+		if end > split {
+			other[addr] = txs[split:end]
+		}
+	}
+	return votes, other
 }
 
 // totalFees computes total consumed miner fees in Planck. Block transactions and receipts have to have the same order.
