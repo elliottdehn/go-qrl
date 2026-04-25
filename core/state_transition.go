@@ -410,13 +410,40 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	st.applyRefundCounter(params.RefundQuotientEIP3529)
 
 	if msg.Paymaster != nil {
-		// Paymaster path: settle via the paymaster contract instead
-		// of native refund + native coinbase tip. The paymaster
-		// holds maxFee in escrow; settle directs actualFee to
-		// coinbase and refunds the rest to the sender.
+		// Paymaster path: settle via the paymaster contract. Split
+		// the user's fee into a burn portion (the EIP-1559 base
+		// fee, converted from QRL to iQRL terms via the oracle)
+		// and a tip portion (the rest, paid to coinbase). This
+		// makes paymaster txs symmetric to native EIP-1559 txs:
+		// both deflate their respective asset by gasUsed*baseFee
+		// and tip the validator the remainder.
+		baseFeeIQRL := paymasterBaseFeeIQRL(st.state, st.qrvm.Context.BaseFee, st.qrvm.Context.BlockNumber.Uint64())
+		burnAmount := new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), baseFeeIQRL)
+
+		// effectiveGasPriceIQRL = min(GasFeeCap, baseFeeIQRL + GasTipCap).
+		effGasPrice := new(big.Int).Add(baseFeeIQRL, msg.GasTipCap)
+		if effGasPrice.Cmp(msg.GasFeeCap) > 0 {
+			effGasPrice.Set(msg.GasFeeCap)
+		}
+		// Floor the tip at zero — if the chain's baseFeeIQRL has
+		// drifted above the tx's signed fee cap, the validator
+		// just gets nothing rather than a negative tip.
+		tipPerGas := new(big.Int).Sub(effGasPrice, baseFeeIQRL)
+		if tipPerGas.Sign() < 0 {
+			tipPerGas.SetInt64(0)
+		}
+		tipAmount := new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), tipPerGas)
+
 		maxFee := new(big.Int).Mul(new(big.Int).SetUint64(st.initialGas), msg.GasPrice)
-		actualFee := new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), msg.GasPrice)
-		if err := st.paymasterSettle(maxFee, actualFee); err != nil {
+		// Defensive cap: burn + tip must not exceed maxFee. With
+		// GasFeeCap == msg.GasPrice (the EIP-1559 invariant the
+		// signer enforces), this always holds; assert for safety.
+		if new(big.Int).Add(burnAmount, tipAmount).Cmp(maxFee) > 0 {
+			return nil, fmt.Errorf("paymaster settle: burn+tip %s exceeds maxFee %s",
+				new(big.Int).Add(burnAmount, tipAmount), maxFee)
+		}
+
+		if err := st.paymasterSettle(maxFee, burnAmount, tipAmount); err != nil {
 			// Settle should be infallible — escrow guarantees the
 			// contract holds maxFee. If we land here it's a chain
 			// invariant violation.
@@ -575,8 +602,13 @@ const PaymasterSystemGasLimit uint64 = 1_000_000
 var (
 	// keccak256("escrow(address,uint256)")[:4]
 	paymasterEscrowSelector = crypto.Keccak256([]byte("escrow(address,uint256)"))[:4]
-	// keccak256("settle(address,uint256,uint256)")[:4]
-	paymasterSettleSelector = crypto.Keccak256([]byte("settle(address,uint256,uint256)"))[:4]
+	// keccak256("settle(address,uint256,uint256,uint256)")[:4]
+	//
+	// settle takes (payer, maxFee, burnAmount, tipAmount). The
+	// burn/tip split is the EIP-1559-equivalent base-fee burn vs
+	// validator tip, computed by consensus from the QRL base fee
+	// converted to iQRL terms via the oracle.
+	paymasterSettleSelector = crypto.Keccak256([]byte("settle(address,uint256,uint256,uint256)"))[:4]
 )
 
 // IsAllowedPaymaster reports whether the given address is on the
@@ -600,11 +632,18 @@ func (st *StateTransition) paymasterEscrow(maxFee *big.Int) error {
 	return nil
 }
 
-// paymasterSettle invokes paymaster.settle(sender, maxFee, actualFee).
-// Called from TransitionDb after execution when the message designated
-// a paymaster.
-func (st *StateTransition) paymasterSettle(maxFee, actualFee *big.Int) error {
-	calldata := encodeAddressUint256Uint256(paymasterSettleSelector, st.msg.From, maxFee, actualFee)
+// paymasterSettle invokes
+// paymaster.settle(sender, maxFee, burnAmount, tipAmount). Called
+// from TransitionDb after execution when the message designated a
+// paymaster.
+//
+// burnAmount + tipAmount must equal gasUsed * effectiveGasPrice in
+// the paymaster's native fee asset (iQRL for PayWithIQRL); the
+// caller is responsible for that math.
+func (st *StateTransition) paymasterSettle(maxFee, burnAmount, tipAmount *big.Int) error {
+	calldata := encodeAddressUint256Uint256Uint256(
+		paymasterSettleSelector, st.msg.From, maxFee, burnAmount, tipAmount,
+	)
 	if err := st.systemCall(*st.msg.Paymaster, calldata); err != nil {
 		return fmt.Errorf("paymaster settle: %w", err)
 	}
@@ -620,6 +659,38 @@ func (st *StateTransition) systemCall(to common.Address, calldata []byte) error 
 	_, _, vmerr := st.qrvm.Call(sender, to, calldata, PaymasterSystemGasLimit, common.Big0)
 	return vmerr
 }
+
+// paymasterBaseFeeIQRL converts the chain's per-gas QRL base fee
+// to its iQRL equivalent using the oracle's current median price.
+//
+// 1 QRL = p^2 iQRL (since 1 iQRL = 1/p^2 QRL by construction). With
+// p stored in 1e18 fixed-point, the conversion is:
+//
+//	baseFeeIQRL = baseFeeQRL * p_scaled^2 / 1e36
+//
+// Returns 0 if the oracle is unhealthy or has no fresh votes — that
+// path leaves the entire fee as tip (no burn) until quorum is
+// restored, rather than risking a wildly wrong baseFee.
+func paymasterBaseFeeIQRL(state vm.StateDB, baseFeeQRL *big.Int, blockNumber uint64) *big.Int {
+	if baseFeeQRL == nil || baseFeeQRL.Sign() == 0 {
+		return new(big.Int)
+	}
+	p, healthy := ComputeOraclePrice(state, blockNumber)
+	if !healthy || p.Sign() == 0 {
+		return new(big.Int)
+	}
+	// baseFeeIQRL = baseFeeQRL * p^2 / 1e36
+	pSquared := new(big.Int).Mul(p, p)
+	out := new(big.Int).Mul(baseFeeQRL, pSquared)
+	return out.Div(out, paymasterPriceScaleSquared)
+}
+
+// paymasterPriceScaleSquared is 1e36 = (1e18)^2, the factor that
+// cancels the 1e18 fixed-point scaling on the squared oracle price.
+var paymasterPriceScaleSquared = func() *big.Int {
+	one := big.NewInt(1_000_000_000_000_000_000)
+	return new(big.Int).Mul(one, one)
+}()
 
 // encodeAddressUint256 builds calldata for `f(address, uint256)`:
 // 4-byte selector || 32-byte address (left-padded) || 32-byte uint256.
@@ -638,5 +709,14 @@ func encodeAddressUint256(selector []byte, addr common.Address, n *big.Int) []by
 func encodeAddressUint256Uint256(selector []byte, addr common.Address, n, m *big.Int) []byte {
 	out := encodeAddressUint256(selector, addr, n)
 	out = append(out, common.LeftPadBytes(m.Bytes(), 32)...)
+	return out
+}
+
+// encodeAddressUint256Uint256Uint256 builds calldata for
+// `f(address, uint256, uint256, uint256)`:
+// 4-byte selector || 32-byte address || 32-byte n || 32-byte m || 32-byte k.
+func encodeAddressUint256Uint256Uint256(selector []byte, addr common.Address, n, m, k *big.Int) []byte {
+	out := encodeAddressUint256Uint256(selector, addr, n, m)
+	out = append(out, common.LeftPadBytes(k.Bytes(), 32)...)
 	return out
 }

@@ -86,13 +86,23 @@ A transaction with type `0x04` (`PaymasterDynamicFeeTx`) carries a
     sentinel address `0xff..fe` before EVM execution; the contract
     pulls `maxFee` of its accepted asset (iQRL) from the sender;
   - after execution, consensus system-calls
-    `paymaster.settle(sender, maxFee, actualFee)`; the contract
-    forwards `actualFee` to `block.coinbase` and refunds the rest;
+    `paymaster.settle(sender, maxFee, burnAmount, tipAmount)`. The
+    `(burn, tip)` split mirrors EIP-1559 base-fee economics:
+      - `burnAmount = gasUsed × baseFeeIQRL` is destroyed via
+        `iqrl.burn`, where `baseFeeIQRL = baseFeeQRL × p²` (oracle-
+        derived; falls to zero when the oracle is unhealthy, leaving
+        the entire fee as tip);
+      - `tipAmount = gasUsed × (min(gasFeeCap, baseFeeIQRL +
+        gasTipCap) - baseFeeIQRL)` is forwarded to `block.coinbase`;
+      - the unused `maxFee - burn - tip` is refunded to the sender.
   - the txpool admits these txs only if `Paymaster` is on the chain
     allowlist (currently a one-element list: `PayWithIQRLAddress`).
 
 The user keeps a buffer of native QRL only for `msg.Value` transfers;
-gas itself can be paid in iQRL indefinitely.
+gas itself can be paid in iQRL indefinitely. Because base-fee burns
+flow into the iQRL side too, iQRL supply responds symmetrically to
+chain activity — paymaster txs are no more or less inflationary
+than native EIP-1559 txs.
 
 ## Genesis pre-deploy
 
@@ -180,11 +190,13 @@ depends on later ones.
     chain accepts them via `eth_sendRawTransaction` and the JSON
     wire format is documented; client-side tooling that builds and
     signs them is still missing.
-  - **Richer paymaster auction.** Today the txpool ranks
-    paymaster txs against native txs via oracle-derived QRL
-    equivalence. A full auction (priority-fee for the paymaster,
-    tip-per-gas split between coinbase and paymaster, etc.) is
-    open work.
+  - **Fee-bearing paymasters.** PayWithIQRL is a pure escrow with
+    no service fee — it forwards everything except the EIP-1559-
+    equivalent burn to coinbase. Future paymasters that do real
+    work (e.g. swap QSD → QRL via the QSD pool) can keep a margin
+    by adjusting the (burn, tip) split they pass to settle; the
+    framework already supports it. Open work is deploying such a
+    paymaster, not extending the framework.
 
 For day-to-day operations see
 [`qsd-deployment.md`](qsd-deployment.md).

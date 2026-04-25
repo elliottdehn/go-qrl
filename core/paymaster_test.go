@@ -69,8 +69,8 @@ func TestPaymasterSelectors_MatchSolidityABI(t *testing.T) {
 	if !bytes.Equal(paymasterEscrowSelector, wantEscrow) {
 		t.Errorf("escrow selector: got %x, want %x", paymasterEscrowSelector, wantEscrow)
 	}
-	// `cast sig "settle(address,uint256,uint256)"` -> 0x3c4c6a28
-	wantSettle := []byte{0x3c, 0x4c, 0x6a, 0x28}
+	// `cast sig "settle(address,uint256,uint256,uint256)"` -> 0xc6a3d074
+	wantSettle := []byte{0xc6, 0xa3, 0xd0, 0x74}
 	if !bytes.Equal(paymasterSettleSelector, wantSettle) {
 		t.Errorf("settle selector: got %x, want %x", paymasterSettleSelector, wantSettle)
 	}

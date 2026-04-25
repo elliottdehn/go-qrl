@@ -273,6 +273,107 @@ func TestPaymaster_RejectsWhenPayerLacksAllowance(t *testing.T) {
 	}
 }
 
+// TestPaymaster_BaseFeeBurn_ReducesTotalSupply exercises the
+// EIP-1559-equivalent burn path: with a non-zero baseFee and a
+// healthy oracle, gasUsed * baseFeeIQRL of the user's iQRL is
+// destroyed via iqrl.burn rather than paid to coinbase. iqrl
+// totalSupply drops by exactly that amount.
+func TestPaymaster_BaseFeeBurn_ReducesTotalSupply(t *testing.T) {
+	var (
+		alice    = common.BytesToAddress(common.FromHex("0x000000000000000000000000000000000000a11c"))
+		bob      = common.BytesToAddress(common.FromHex("0x0000000000000000000000000000000000000b0b"))
+		coinbase = common.BytesToAddress(common.FromHex("0x000000000000000000000000000000000000c01b"))
+	)
+
+	sdb := newPredeployedState(t, alice)
+
+	// Make alice a validator and post her own submitVote so the
+	// oracle is healthy with a known price. Use $1.00 (p_scaled =
+	// 1e18) so baseFeeIQRL = baseFeeQRL exactly.
+	registerValidator(t, sdb, alice)
+	pegPrice, _ := new(big.Int).SetString("1000000000000000000", 10)
+	// Pack the vote slot directly: bytes [16:32] = price,
+	// bytes [8:16] = blockNumber.
+	var voteSlot common.Hash
+	priceB := common.LeftPadBytes(pegPrice.Bytes(), 16)
+	copy(voteSlot[16:32], priceB)
+	voteSlot[15] = 1 // blockNumber low byte
+	sdb.SetState(InverseQRLAddress, common.HexToHash("0x"+
+		"0000000000000000000000000000000000000000000000000000000000000002"),
+		common.Hash{}) // unused, illustrative
+	// Vote storage is in ValidatorOracle, not iQRL.
+	sdb.SetState(ValidatorOracleAddress, ValidatorVoteStorageSlot(alice), voteSlot)
+
+	// Confirm the off-chain price computation agrees.
+	if got, healthy := ComputeOraclePrice(sdb, 1); !healthy || got.Cmp(pegPrice) != 0 {
+		t.Fatalf("oracle pre-state: got (%s, healthy=%v), want ($1.00, true)", got, healthy)
+	}
+
+	// Fund alice's iQRL and approve the paymaster.
+	aliceIQRL, _ := new(big.Int).SetString("1000000000000000000000000", 10) // 1e24
+	sdb.SetState(InverseQRLAddress, erc20BalanceSlot(alice), uintToHash(aliceIQRL))
+	sdb.SetState(InverseQRLAddress,
+		erc20AllowanceSlot(alice, PayWithIQRLAddress),
+		uintToHash(new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))),
+	)
+	totalSupplyBefore := aliceIQRL
+	sdb.SetState(InverseQRLAddress, common.HexToHash("0x"+
+		"0000000000000000000000000000000000000000000000000000000000000002"),
+		uintToHash(totalSupplyBefore))
+
+	// Build the paymaster tx with a non-zero base fee.
+	baseFee := big.NewInt(2_000_000_000) // 2 gwei
+	gasPrice := big.NewInt(5_000_000_000) // 5 gwei (i.e. tipCap = 3, feeCap = 5)
+	msg := &Message{
+		From:      alice,
+		To:        &bob,
+		Nonce:     0,
+		Value:     big.NewInt(0),
+		GasLimit:  100_000,
+		GasPrice:  gasPrice,
+		GasFeeCap: gasPrice,
+		GasTipCap: new(big.Int).Sub(gasPrice, baseFee), // tipCap = 3 gwei
+		Paymaster: &PayWithIQRLAddress,
+	}
+
+	result := applyPaymasterMessage(t, sdb, msg, baseFee)
+	if result.Failed() {
+		t.Fatalf("execution failed: %v", result.Err)
+	}
+
+	// Expected split:
+	//   burn = gasUsed * baseFeeIQRL = gasUsed * baseFeeQRL (at peg)
+	//   tip  = gasUsed * (effGasPrice - baseFeeIQRL) = gasUsed * tipCap
+	expectedBurn := new(big.Int).Mul(new(big.Int).SetUint64(result.UsedGas), baseFee)
+	expectedTip := new(big.Int).Mul(new(big.Int).SetUint64(result.UsedGas), msg.GasTipCap)
+
+	totalSupplyAfter := sdb.GetState(InverseQRLAddress, common.HexToHash("0x"+
+		"0000000000000000000000000000000000000000000000000000000000000002")).Big()
+	burned := new(big.Int).Sub(totalSupplyBefore, totalSupplyAfter)
+	if burned.Cmp(expectedBurn) != 0 {
+		t.Errorf("iqrl burned: got %s, want %s", burned, expectedBurn)
+	}
+
+	// Coinbase received exactly the tip portion.
+	gotTip := sdb.GetState(InverseQRLAddress, erc20BalanceSlot(coinbase)).Big()
+	if gotTip.Cmp(expectedTip) != 0 {
+		t.Errorf("coinbase tip: got %s, want %s", gotTip, expectedTip)
+	}
+
+	// Alice paid exactly burn+tip out of her iQRL balance.
+	aliceAfter := sdb.GetState(InverseQRLAddress, erc20BalanceSlot(alice)).Big()
+	paid := new(big.Int).Sub(aliceIQRL, aliceAfter)
+	expectedPaid := new(big.Int).Add(expectedBurn, expectedTip)
+	if paid.Cmp(expectedPaid) != 0 {
+		t.Errorf("alice paid: got %s, want %s", paid, expectedPaid)
+	}
+
+	// Paymaster contract drained.
+	if pm := sdb.GetState(InverseQRLAddress, erc20BalanceSlot(PayWithIQRLAddress)).Big(); pm.Sign() != 0 {
+		t.Errorf("paymaster residual %s, want 0", pm)
+	}
+}
+
 func TestPaymaster_VmRevert_StillSettles(t *testing.T) {
 	// When the user's call reverts inside the EVM, the paymaster
 	// must still settle correctly: alice still pays for the gas that
