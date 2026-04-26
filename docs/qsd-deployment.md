@@ -48,14 +48,14 @@ bytecode at dump time.
 The voting parameters (`OracleVoteStalenessBlocks`,
 `OracleMinQuorumNumerator`, `OracleMinQuorumDenominator`) are
 **baked into the predeploy bytecode**. Default values come from
-`qsd-contracts/script/Predeploy.s.sol` (currently 10, 2, 3). If you
+`contracts/script/Predeploy.s.sol` (currently 10, 2, 3). If you
 need different values, regenerate the genesis dump:
 
 ```sh
-cd qsd-contracts
+cd contracts
 # Edit script/Predeploy.s.sol VOTE_STALENESS_BLOCKS / MIN_QUORUM_*
 forge script script/Predeploy.s.sol --tc PredeployScript -vv
-cp out/qsd-genesis-state.json ../go-qrl/core/qsd_predeploy_state.json
+cp out/qsd-genesis-state.json ../core/qsd_predeploy_state.json
 ```
 
 Then update the matching constants in `core/qsd_predeploy.go`

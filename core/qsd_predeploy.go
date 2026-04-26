@@ -23,7 +23,7 @@ import (
 // arguments stored as `immutable` fields), so the only way to read
 // them off-chain without ABI calls is to mirror them as Go
 // constants. Keep these in lockstep with
-// qsd-contracts/script/Predeploy.s.sol.
+// contracts/script/Predeploy.s.sol.
 const (
 	OracleVoteStalenessBlocks  = 10
 	OracleMinQuorumNumerator   = 2
@@ -126,7 +126,7 @@ type dumpedAccount struct {
 
 // AddQSDStabilityLayer registers the four QSD-stability-layer
 // contracts in the supplied GenesisAlloc, populated from the embedded
-// state dump produced by qsd-contracts/script/Predeploy.s.sol.
+// state dump produced by contracts/script/Predeploy.s.sol.
 //
 // The dump bakes in:
 //
