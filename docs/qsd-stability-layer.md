@@ -41,12 +41,14 @@ Downstream tooling (deploy scripts, the `qsdfeeder` daemon, RPC
 clients, wallets) should target these constants by name rather than
 hard-coding the hex.
 
-## Solvency invariant (QSD)
+## Stablecoin construction (QSD)
 
 QSD is the LP token of a CPMM between native QRL and iQRL. Because
 iQRL is inverse-priced (`USD(iQRL) = 1/p`), the pair is invariant
 under price moves: there is no impermanent loss, and no swap fee is
 charged.
+
+### Solvency invariant
 
 Per-deposit solvency follows from AM-GM applied to the depositor's
 contribution; aggregate solvency follows from Cauchy-Schwarz over
@@ -58,6 +60,31 @@ per-deposit contributions. Concretely:
 
 where `k` is the CPMM product of pool reserves. The contract asserts
 this invariant on every state mutation.
+
+### Redemption: oracle-independent, pro-rata
+
+`QSD.redeem(q)` pays out `(poolQRL · q / totalSupply, poolIQRL · q
+/ totalSupply)`. No oracle read, no health check. The slice is a
+verifiable on-chain claim that no external feed can corrupt or
+delay.
+
+USD value of a redemption slice is `(q / totalSupply) · V` where
+`V = A·p + B/p` is the pool's USD value at market price `p`. By
+the solvency invariant `V ≥ 2·sqrt(k) ≥ totalSupply`, so this is
+always at least `q` dollars. Equality holds only when the pool
+sits at its symmetric-balanced marginal-price state; any swap or
+asymmetric deposit pushes V above `totalSupply` (call it "slack")
+and pro-rata redemption distributes that slack to redeemers
+continuously rather than letting it accumulate indefinitely in
+the pool.
+
+QSD is therefore a yield-bearing share of the pool with a strict
+$1 floor, not a strict $1-pegged stablecoin. Holders never receive
+less than $1 of value per QSD on redemption; long-term holders see
+per-token value drift upward as the pool absorbs swap volume. The
+crucial liveness property: redemption has no dependency on the
+oracle or on the validator set, so even a complete oracle outage
+leaves holders able to exit at full pool-share value.
 
 ## Consensus-layer rules
 
@@ -104,9 +131,11 @@ order during block construction.
 
 This guarantees the on-chain oracle's per-block median is finalized
 by the time any non-vote tx in the same block runs. Paymaster fee
-splits, `QSD.redeem`, `InverseQRL.mint`, and any other code that
-reads `oracle.price()` / `oracle.healthy()` see the post-vote
-median, never a stale one mid-block.
+splits, `InverseQRL.mint`, and any other code that reads
+`oracle.price()` / `oracle.healthy()` see the post-vote median,
+never a stale one mid-block. (`QSD.redeem` deliberately does not
+depend on the oracle; redemption is a pure pool-share claim. See
+section "Stablecoin construction" below.)
 
 ### 3. Proposer-vote rule
 

@@ -89,8 +89,7 @@ contract QSD is ERC20, ReentrancyGuard {
         address indexed user,
         uint256 qsdBurned,
         uint256 qrlReturned,
-        uint256 iqrlReturned,
-        uint256 priceAtRedemption
+        uint256 iqrlReturned
     );
 
     event Swapped(
@@ -176,35 +175,45 @@ contract QSD is ERC20, ReentrancyGuard {
         emit Deposited(msg.sender, qrlAmount, iqrlAmount, qsdMinted);
     }
 
-    /// @notice Burn `qsdAmount` QSD and receive a 1/V slice of the
-    ///         pool, where V is the pool's USD value at the current
-    ///         oracle price.
+    /// @notice Burn `qsdAmount` QSD and receive a pro-rata slice of
+    ///         the pool reserves, sized strictly by `qsdAmount /
+    ///         totalSupply`. No oracle dependency: the pool itself
+    ///         is the source of truth, and the slice is a verifiable
+    ///         on-chain claim that no external feed can corrupt.
     /// @param  qsdAmount   Amount of QSD to burn.
     /// @return qrlReturned QRL returned to the caller (native send).
     /// @return iqrlReturned iQRL returned to the caller.
-    /// @dev    Always pays exactly $1 of value per QSD burned.
+    /// @dev    Pays >= $1 of USD value per QSD burned, with equality
+    ///         only when the pool sits at its symmetric-balanced
+    ///         marginal-price state. Any swap or asymmetric deposit
+    ///         pushes V above totalSupply (call this "slack") and
+    ///         redemptions distribute that slack pro-rata to
+    ///         redeemers, rather than letting it accumulate
+    ///         indefinitely in the pool. QSD is therefore a yield-
+    ///         bearing share of the pool with a strict $1 floor, not
+    ///         a strict $1-pegged stablecoin.
+    ///
+    ///         Redemption has no liveness dependency on the oracle:
+    ///         even if every validator goes silent, holders can
+    ///         exit the system at any time.
     function redeem(uint256 qsdAmount)
         external
         nonReentrant
         returns (uint256 qrlReturned, uint256 iqrlReturned)
     {
         if (qsdAmount == 0) revert ZeroAmount();
-        if (!oracle.healthy()) revert OracleUnhealthy();
 
-        uint256 p = oracle.price();
+        uint256 supply = totalSupply();
+        if (supply == 0) revert EmptyPool();
 
-        // V = poolQRL * p + poolIQRL / p   (USD-scaled by 1e18)
-        uint256 V = (poolQRL * p) / SCALE + (poolIQRL * SCALE) / p;
-        if (V == 0) revert EmptyPool();
-
-        // Pro-rata-by-value slice. Integer division rounds payouts
+        // Pro-rata-by-supply slice. Integer division rounds payouts
         // DOWN, which favors the pool and tightens solvency.
-        qrlReturned = (poolQRL * qsdAmount) / V;
-        iqrlReturned = (poolIQRL * qsdAmount) / V;
+        qrlReturned = (poolQRL * qsdAmount) / supply;
+        iqrlReturned = (poolIQRL * qsdAmount) / supply;
 
-        // Sanity: slice can never exceed reserves. By solvency
-        // (qsdAmount <= totalSupply <= V) and the formula above,
-        // qrlReturned <= poolQRL and iqrlReturned <= poolIQRL exactly.
+        // Sanity: slice can never exceed reserves. By construction
+        // qsdAmount <= supply, so qrlReturned <= poolQRL and
+        // iqrlReturned <= poolIQRL.
         assert(qrlReturned <= poolQRL);
         assert(iqrlReturned <= poolIQRL);
 
@@ -219,12 +228,14 @@ contract QSD is ERC20, ReentrancyGuard {
         if (iqrlReturned > 0) iqrl.safeTransfer(msg.sender, iqrlReturned);
         if (qrlReturned > 0) _payNative(msg.sender, qrlReturned);
 
-        // Redemptions preserve the AM-GM solvency floor: k shrinks at
-        // rate qsdAmount/V <= 1, supply shrinks at rate qsdAmount,
-        // and supply <= V so the slack only grows.
+        // Pro-rata redemption preserves the solvency invariant
+        // 2*sqrt(k) >= totalSupply: both reserves and supply scale
+        // by the same factor (supply - q) / supply, so the
+        // inequality is invariant under redemption modulo floor-
+        // rounding (which only adds slack, never subtracts).
         _assertSolvent();
 
-        emit Redeemed(msg.sender, qsdAmount, qrlReturned, iqrlReturned, p);
+        emit Redeemed(msg.sender, qsdAmount, qrlReturned, iqrlReturned);
     }
 
     // ------------------------------------------------------------------
