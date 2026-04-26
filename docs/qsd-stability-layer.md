@@ -1,12 +1,21 @@
 # QSD Stability Layer
 
-The QSD stability layer is a set of four on-chain primitives plus
-two consensus-layer rules that together implement a QRL-native,
-dollar-denominated stablecoin and an iQRL-denominated fee path.
+The QSD stability layer is a set of four on-chain primitives plus a
+small set of consensus-layer rules that together implement a QRL-
+native, dollar-denominated stablecoin and an iQRL-denominated fee
+path.
+
+The whole layer is gated behind a single fork flag (`QSDTime`). On
+chains where the flag is unset or hasn't activated yet, the rules
+below are no-ops and the predeploys do not exist. Networks that
+schedule the flag mid-chain install the predeploys at the activation
+block; networks that bake them in at genesis hit the same code path
+on a fast no-op.
 
 This document describes the layer at the level a node operator or
 deploy-script author needs. The protocol-level rationale lives in the
-QRL grant proposal.
+QRL grant proposal. For a hands-on walkthrough that runs the full
+flow against a dev node, see [`qsd-demo.md`](qsd-demo.md).
 
 ## Components
 
@@ -52,9 +61,11 @@ this invariant on every state mutation.
 
 ## Consensus-layer rules
 
-The stability layer adds two narrow rules to the state-transition
-engine. Both are gated on contract-storage SLOADs so they're cheap
-and don't require a hard-fork flag beyond the genesis activation.
+The stability layer adds four rules to the state-transition engine.
+Each one is gated on the QSD fork flag (`config.IsQSD(header.Time)`)
+so pre-fork blocks behave exactly like a vanilla post-Zond chain.
+Within the gate, the per-rule checks themselves are cheap (one or
+two storage SLOADs at most).
 
 ### 1. Free validator votes
 
@@ -76,7 +87,50 @@ net cost is zero. A reverted submitVote (e.g. wrong
 `forBlockNumber`) or a second vote in the same block from the same
 validator pays normal gas as anti-spam.
 
-### 2. iQRL paymaster
+Free votes additionally **do not consume block gas**. The execution
+returns its full `initialGas` allocation back to the block's
+`GasPool` and reports `result.UsedGas == 0`, so a block packed with
+N validator votes has the same effective gas budget for user txs as
+a block with zero votes. Without this, a network with N active
+validators would burn `~N × voteGas` of every block's gas-limit
+budget on infrastructure before any user tx got a chance to land.
+
+### 2. Vote ordering
+
+Within a single block, every `submitVote` tx must come before every
+non-vote tx. `core.validateVoteOrdering` enforces it in
+`ValidateBody`; the miner's `partitionVoteTxs` arranges the same
+order during block construction.
+
+This guarantees the on-chain oracle's per-block median is finalized
+by the time any non-vote tx in the same block runs. Paymaster fee
+splits, `QSD.redeem`, `InverseQRL.mint`, and any other code that
+reads `oracle.price()` / `oracle.healthy()` see the post-vote
+median, never a stale one mid-block.
+
+### 3. Proposer-vote rule
+
+If a block's coinbase is registered as a validator (per parent
+state), the block must contain at least one tx satisfying:
+
+  - `sender == coinbase`,
+  - `IsSubmitVoteTx(tx) == true`, and
+  - the decoded `forBlockNumber` argument equals the block's number.
+
+The proposer is free to also include other validators' votes — those
+are regular user-signed txs that pass the rest of the body checks
+on their own. The rule only fires when a registered validator is
+proposing AND no submitVote of their own is in the body.
+
+Why: a non-voting active validator could otherwise propose blocks
+indefinitely without contributing to the oracle median. The rule
+guarantees one fresh price every block from the producer themselves,
+even if other validators are silent or offline. The miner mirrors
+the rule (`miner.ensureProposerVote`) and refuses to assemble a
+block that would fail it, so an operator running `qsdfeeder` never
+accidentally produces a body their peers will reject.
+
+### 4. iQRL paymaster
 
 A transaction with type `0x04` (`PaymasterDynamicFeeTx`) carries a
 `Paymaster` field naming a contract that handles fees. When set:
@@ -104,17 +158,50 @@ flow into the iQRL side too, iQRL supply responds symmetrically to
 chain activity — paymaster txs are no more or less inflationary
 than native EIP-1559 txs.
 
+## Fork activation
+
+`params.ChainConfig.QSDTime *uint64` schedules the layer's
+activation at the first block whose `header.Time >= *QSDTime`. Set
+to `nil` (the default for mainnet, testnet, betanet) the entire
+layer is dormant: no predeploys exist, no rules fire, type-0x04
+paymaster txs are rejected at admission and at block validation,
+and `IsQSD(t)` returns false unconditionally.
+
+Two activation paths are supported, both byte-for-byte equivalent
+post-activation:
+
+  - **Genesis activation** (`QSDTime: newUint64(0)`): the genesis
+    `GenesisAlloc` already carries the four predeploys, so the
+    activation install is a no-op fast path. Used by
+    `AllDevChainProtocolChanges` and dev-mode genesis.
+  - **Mid-chain activation** (`QSDTime: newUint64(<future ts>)`):
+    the chain runs vanilla until the timestamp crosses, at which
+    point `state_processor.Process` calls
+    `InstallQSDPredeploysIfMissing` and seeds the four contracts'
+    bytecode and storage from the same embedded JSON dump that
+    genesis would have used. Subsequent blocks short-circuit on a
+    single `GetCodeSize` probe.
+
+The mid-chain path is the one real networks will use: it lets a
+chain ship the layer without rolling a new genesis.
+
 ## Genesis pre-deploy
 
 `AddQSDStabilityLayer(alloc, params)` registers the four addresses
-in a `GenesisAlloc`. `QSDPredeployParams` currently has no fields:
-the validator set is consensus-driven (see "Validator set source"
-below) and the voting parameters are baked into bytecode.
+in a `GenesisAlloc`, used by chains that activate QSD at genesis.
+`QSDPredeployParams` currently has no fields: the validator set is
+consensus-driven (see "Validator set source" below) and the voting
+parameters are baked into bytecode.
+
+Networks that activate later use `InstallQSDPredeploysIfMissing`,
+which reads the same embedded dump but writes directly into the
+state DB at the activation block. Either way, the post-activation
+contract code and initial storage are identical.
 
 Voting parameters (`voteStalenessBlocks`, `minQuorumNumerator`,
 `minQuorumDenominator`) are immutable in the ValidatorOracle
-bytecode and therefore frozen into the genesis-state dump; changing
-them requires regenerating that dump.
+bytecode and therefore frozen into the embedded state dump;
+changing them requires regenerating that dump.
 
 ### Validator set source
 
@@ -158,6 +245,13 @@ With consensus rule (1) those votes cost validators zero gas in
 steady state. See [`cmd/qsdfeeder/README.md`](../cmd/qsdfeeder/README.md)
 for build and operation.
 
+The proposer-vote rule (rule 3 above) makes `qsdfeeder` mandatory
+for an active validator: a block proposed without the proposer's
+own submitVote in the body fails `ValidateBody` and gets rejected
+by peers. The miner enforces the same rule pre-broadcast, so a
+validator running without `qsdfeeder` doesn't propagate invalid
+blocks; they just fail to produce blocks at all.
+
 The vote calldata is `submitVote(uint256 forBlockNumber, uint256
 priceUsd1e18)` — selector `0x6f93bfb7`, followed by two 32-byte
 big-endian uint256s. Price is scaled by `1e18` (so `$1.00 / QRL` is
@@ -168,21 +262,13 @@ fresher vote with a stale price when it eventually mines, and the
 txpool evicts stale-target votes on every chain-head advance so
 they don't waste block space.
 
-## Status
+## Demo
 
-Branch `qsd-stability-layer` lands the layer in nine additive commits:
-
-1. Genesis pre-deploy — reserves addresses. ✅
-2. Validator daemon scaffold — `cmd/qsdfeeder` stub. ✅
-3. Real submitter — keystore-backed, EIP-1559, signed via `qrlclient`. ✅
-4. Bytecode bake — populated `GenesisAccount{Code, Storage}` from Foundry. ✅
-5. Strict block-targeted votes — `submitVote(forBlockNumber, ...)`. ✅
-6. iQRL paymaster — type `0x04` tx + `PayWithIQRL` predeploy + state-transition hook + integration tests. ✅
-7. Free validator votes at consensus + integration tests. ✅
-8. Stale-vote eviction in the txpool. ✅
-
-Each step is independently testable; nothing in earlier steps
-depends on later ones.
+A self-contained walkthrough runs the entire layer end-to-end
+against `gqrl --dev`: mint iQRL, deposit paired QRL+iQRL into the
+QSD pool, swap on the pool with the transaction's fees paid in
+iQRL via a type-0x04 paymaster, and redeem QSD back to its pro-rata
+slice. See [`qsd-demo.md`](qsd-demo.md).
 
 ## Open work
 
