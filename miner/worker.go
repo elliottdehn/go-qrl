@@ -99,6 +99,16 @@ func (miner *Miner) generateWork(params *generateParams) *newPayloadResult {
 		if errors.Is(err, errBlockInterruptedByTimeout) {
 			log.Warn("Block building is interrupted", "allowance", common.PrettyDuration(miner.config.Recommit))
 		}
+	} else if miner.chainConfig.IsQSD(work.header.Time) {
+		// noTxs=true builds the empty payload that gets delivered
+		// while the full one is still being filled. Even with no
+		// txs we have to fire pokeCache, because the validator's
+		// state_processor.Process always fires it on QSD-active
+		// blocks; without a matching invocation here the empty
+		// payload's state root won't match what peers compute.
+		if err := miner.pokeOracleCache(work); err != nil {
+			return &newPayloadResult{err: err}
+		}
 	}
 	body := types.Body{
 		Transactions: work.txs,
@@ -347,6 +357,15 @@ func (miner *Miner) fillTransactions(interrupt *atomic.Int32, env *environment) 
 		if err := ensureProposerVote(env); err != nil {
 			return err
 		}
+
+		// Fire pokeCache at the vote→non-vote boundary, mirroring
+		// the system call state_processor.Process makes on the
+		// validator path. Without this, non-vote txs run against a
+		// stale cache during construction but a fresh one during
+		// validation, and the resulting state roots diverge.
+		if err := miner.pokeOracleCache(env); err != nil {
+			return err
+		}
 	}
 	// Then everything else.
 	if len(localOther) > 0 {
@@ -428,6 +447,17 @@ func ensureProposerVote(env *environment) error {
 	}
 	isValidator := func(addr common.Address) bool { return addr == env.coinbase }
 	return core.ValidateProposerVote(env.coinbase, env.header.Number.Uint64(), env.txs, env.signer, isValidator)
+}
+
+// pokeOracleCache fires the pokeCache() system call against env.state,
+// rebuilding ValidatorOracle's per-block median cache. Called from
+// the miner at the same vote→non-vote boundary that
+// state_processor.Process uses on the validator path so the state
+// root we produce matches what peers compute.
+func (miner *Miner) pokeOracleCache(env *environment) error {
+	blockCtx := core.NewQRVMBlockContext(env.header, miner.chain, &env.coinbase)
+	qrvm := vm.NewQRVM(blockCtx, vm.TxContext{}, env.state, miner.chainConfig, vm.Config{})
+	return core.ProcessPokeCache(qrvm)
 }
 
 // totalFees computes total consumed miner fees in Planck. Block transactions and receipts have to have the same order.

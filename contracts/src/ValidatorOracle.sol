@@ -174,7 +174,10 @@ contract ValidatorOracle is IPriceOracle {
             mstore(toRemove, nRemove)
         }
 
-        _updateCache();
+        // Cache is intentionally NOT updated here either. The
+        // post-vote-phase pokeCache() system call is what finalizes
+        // the median for this block, after both the new validator
+        // set AND any votes from it have settled into storage.
         emit ValidatorSetChanged(added, toRemove);
     }
 
@@ -207,7 +210,14 @@ contract ValidatorOracle is IPriceOracle {
             price: uint128(priceUsd1e18),
             blockNumber: uint64(block.number)
         });
-        _updateCache();
+        // Cache is intentionally NOT updated here. Consensus invokes
+        // pokeCache() once per block as a system call after the vote
+        // phase finishes, so the median is rebuilt exactly once over
+        // all of this block's votes instead of N times. Reads via
+        // price()/healthy() in subsequent non-vote txs see the
+        // freshly-updated cache; reads that somehow happen during
+        // the vote phase fall through to the on-the-fly recompute
+        // path (cachedAtBlock != block.number).
         emit VoteSubmitted(msg.sender, priceUsd1e18, block.number);
     }
 

@@ -325,12 +325,24 @@ contract ValidatorOracleTest is Test {
     // per-block cache
     // ------------------------------------------------------------------
 
-    function test_Cache_PopulatedOnSubmitVote() public {
+    // Cache-population tests. The contract intentionally does NOT
+    // update the cache from inside submitVote / setValidatorSet:
+    // consensus calls pokeCache() once per block as a system call
+    // after the vote phase, and that is the canonical refresh path.
+    // These tests invoke pokeCache() directly to simulate the
+    // consensus invocation.
+
+    function test_PokeCache_PopulatesAfterSubmitVotes() public {
         _addAllValidators();
         for (uint256 i = 0; i < 4; i++) {
             vm.prank(vs[i]);
             oracle.submitVote(block.number,ONE * (i + 1));
         }
+        // submitVote alone does NOT touch the cache.
+        (, uint64 beforeBlock,) = oracle.cache();
+        assertEq(beforeBlock, 0);
+
+        oracle.pokeCache();
 
         (uint128 cachedPrice, uint64 cachedBlock, uint8 healthyFlag) = oracle.cache();
         assertEq(cachedBlock, uint64(block.number));
@@ -339,10 +351,15 @@ contract ValidatorOracleTest is Test {
         assertEq(healthyFlag, 1); // 4 of 5 = 12/15 ≥ 10/15
     }
 
-    function test_Cache_PopulatedOnSetValidatorSet_Add() public {
+    function test_PokeCache_AfterSetValidatorSet_Add() public {
         address[] memory one = new address[](1);
         one[0] = vs[0];
         _setSet(one);
+        // setValidatorSet alone does NOT touch the cache.
+        (, uint64 b0,) = oracle.cache();
+        assertEq(b0, 0);
+
+        oracle.pokeCache();
         (, uint64 b1,) = oracle.cache();
         assertEq(b1, uint64(block.number));
 
@@ -351,12 +368,14 @@ contract ValidatorOracleTest is Test {
         two[0] = vs[0];
         two[1] = vs[1];
         _setSet(two);
+        oracle.pokeCache();
         (, uint64 b2,) = oracle.cache();
         assertEq(b2, uint64(block.number));
     }
 
-    function test_Cache_PopulatedOnSetValidatorSet_Remove() public {
+    function test_PokeCache_AfterSetValidatorSet_Remove() public {
         _addAllValidators();
+        oracle.pokeCache();
         vm.roll(block.number + 1);
         // Drop vs[2].
         address[] memory next = new address[](4);
@@ -365,6 +384,7 @@ contract ValidatorOracleTest is Test {
         next[2] = vs[3];
         next[3] = vs[4];
         _setSet(next);
+        oracle.pokeCache();
         (, uint64 cachedBlock,) = oracle.cache();
         assertEq(cachedBlock, uint64(block.number));
     }
@@ -375,7 +395,10 @@ contract ValidatorOracleTest is Test {
             vm.prank(vs[i]);
             oracle.submitVote(block.number,ONE * (i + 1));
         }
-        // First read in same block as last vote → cache hit.
+        // Consensus would invoke pokeCache here as a system call.
+        oracle.pokeCache();
+
+        // First read in same block as pokeCache → cache hit.
         uint256 g1 = gasleft();
         oracle.price();
         uint256 hitGas = g1 - gasleft();
@@ -389,7 +412,7 @@ contract ValidatorOracleTest is Test {
         // Hit should be substantially cheaper than miss.
         assertLt(hitGas, missGas, "cache hit not cheaper");
         // Concrete bound: cache hit reads 1 storage slot; miss reads N
-        // storage slots and runs insertion sort. We expect at least 2x.
+        // storage slots and runs quickselect. We expect at least 2x.
         assertLt(hitGas * 2, missGas);
     }
 
@@ -399,7 +422,7 @@ contract ValidatorOracleTest is Test {
             vm.prank(vs[i]);
             oracle.submitVote(block.number,ONE * (i + 1));
         }
-        // Cache populated in this block.
+        oracle.pokeCache();
         (, uint64 cachedAt,) = oracle.cache();
         assertEq(cachedAt, uint64(block.number));
 
