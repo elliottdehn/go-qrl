@@ -107,20 +107,14 @@ func (s *keyedSubmitter) SubmitVote(
 	feeCap.Add(feeCap, tipCap)
 
 	to := s.oracleAddress
-	gas, err := s.client.EstimateGas(ctx, qrl.CallMsg{
-		From:      s.from,
-		To:        &to,
-		GasFeeCap: feeCap,
-		GasTipCap: tipCap,
-		Data:      calldata,
-	})
-	if err != nil {
-		return fmt.Errorf("estimate gas: %w", err)
-	}
-	// 20% headroom — submitVote() touches dynamic state (median
-	// recompute on quorum-completing votes) and EstimateGas can
-	// under-shoot in those branches.
-	gas = gas + gas/5
+	// submitVote intentionally reverts unless forBlockNumber ==
+	// block.number, which means an EstimateGas against `latest`
+	// (where block.number == head) will revert when forBlockNumber
+	// targets head+offset. Skip the estimate and use a fixed gas
+	// budget. submitVote's cost is bounded by the validator count
+	// (median computation on at most MAX_VALIDATORS = 100), so 200k
+	// is an order-of-magnitude headroom over the steady-state cost.
+	const gas uint64 = 200_000
 
 	tx, err := types.SignNewTx(
 		s.wallet,

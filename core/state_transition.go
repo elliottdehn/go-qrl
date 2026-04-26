@@ -693,7 +693,10 @@ func (st *StateTransition) paymasterSettle(maxFee, burnAmount, tipAmount *big.In
 // reverted.
 func (st *StateTransition) systemCall(to common.Address, calldata []byte) error {
 	sender := vm.AccountRef(SystemCallerAddress)
-	_, _, vmerr := st.qrvm.Call(sender, to, calldata, PaymasterSystemGasLimit, common.Big0)
+	ret, _, vmerr := st.qrvm.Call(sender, to, calldata, PaymasterSystemGasLimit, common.Big0)
+	if vmerr != nil && len(ret) > 0 {
+		return fmt.Errorf("%w (revert data: 0x%x)", vmerr, ret)
+	}
 	return vmerr
 }
 

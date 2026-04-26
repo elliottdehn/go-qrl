@@ -129,9 +129,11 @@ func TestKeyedSubmitter_HappyPath(t *testing.T) {
 	if tx.GasTipCap().Cmp(rpc.tipCap) != 0 {
 		t.Errorf("tipCap: got %s, want %s", tx.GasTipCap(), rpc.tipCap)
 	}
-	// Gas == estimate * 1.2 = 60_000.
-	if tx.Gas() != 60_000 {
-		t.Errorf("gas: got %d, want 60000", tx.Gas())
+	// Gas: keyed submitter uses a fixed 200k budget (EstimateGas
+	// would revert against `latest` because submitVote requires
+	// forBlockNumber == block.number).
+	if tx.Gas() != 200_000 {
+		t.Errorf("gas: got %d, want 200000", tx.Gas())
 	}
 	// Calldata is exactly what EncodeSubmitVoteCalldata produced.
 	wantData, _ := EncodeSubmitVoteCalldata(big.NewInt(1234), price)
@@ -173,7 +175,6 @@ func TestKeyedSubmitter_PropagatesRPCErrors(t *testing.T) {
 		{"nonce", func(f *fakeRPC) { f.failNonce = true }, "fetch nonce"},
 		{"tip", func(f *fakeRPC) { f.failTip = true }, "suggest tip cap"},
 		{"header", func(f *fakeRPC) { f.failHeader = true }, "fetch header"},
-		{"estimate", func(f *fakeRPC) { f.failEstimate = true }, "estimate gas"},
 		{"send", func(f *fakeRPC) { f.failSend = true }, "send tx"},
 	}
 	for _, c := range cases {

@@ -211,6 +211,13 @@ func makeFullNode(ctx *cli.Context) (*node.Node, qrlapi.Backend) {
 		if err != nil {
 			utils.Fatalf("failed to register dev mode catalyst service: %v", err)
 		}
+		// Wire the simulated beacon's fee recipient to the configured
+		// miner pending fee recipient (which dev-mode setup pins to
+		// the developer faucet). Without this, all sealed blocks have
+		// block.coinbase == address(0), which breaks any tx whose
+		// settlement transfers an ERC-20 to the coinbase — e.g. the
+		// iQRL paymaster's tip path.
+		simBeacon.SetFeeRecipient(cfg.QRL.Miner.PendingFeeRecipient)
 		catalyst.RegisterSimulatedBeaconAPIs(stack, simBeacon)
 		stack.RegisterLifecycle(simBeacon)
 	} else {
