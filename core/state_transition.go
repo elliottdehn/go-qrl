@@ -489,12 +489,20 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	// pre-charged buyGas debit is refunded and no tip is paid. The
 	// candidate flag was captured pre-execution; we only honour it
 	// if the EVM call also succeeded (no revert).
+	//
+	// Free votes also do not count against the block gas limit.
+	// Return ALL initialGas to the gas pool (not just gasRemaining)
+	// and report UsedGas = 0 so the state processor's running
+	// totals and the receipt's GasUsed both stay flat. Without this,
+	// a network with N active validators would burn ~N * voteGas of
+	// the block's gas-limit budget every block before any user
+	// transaction got a chance to land.
 	if vmerr == nil && freeVoteCandidate {
 		full := new(big.Int).Mul(new(big.Int).SetUint64(st.initialGas), msg.GasPrice)
 		st.state.AddBalance(msg.From, full)
-		st.gp.AddGas(st.gasRemaining)
+		st.gp.AddGas(st.initialGas)
 		return &ExecutionResult{
-			UsedGas:    st.gasUsed(),
+			UsedGas:    0,
 			Err:        vmerr,
 			ReturnData: ret,
 		}, nil

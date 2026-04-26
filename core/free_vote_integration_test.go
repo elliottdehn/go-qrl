@@ -11,7 +11,9 @@ import (
 
 	"github.com/theQRL/go-qrl/common"
 	"github.com/theQRL/go-qrl/core/state"
+	"github.com/theQRL/go-qrl/core/vm"
 	"github.com/theQRL/go-qrl/crypto"
+	"github.com/theQRL/go-qrl/params"
 )
 
 // registerValidator faithfully mirrors what
@@ -285,6 +287,70 @@ func TestFreeVote_VoteFedIntoOracleMedian(t *testing.T) {
 	}
 	if got.Cmp(want) != 0 {
 		t.Errorf("oracle median: got %s, want %s", got, want)
+	}
+}
+
+// TestFreeVote_DoesNotCountTowardBlockGas verifies the consensus
+// invariant added when the network outgrew the "free vote still
+// debits the block gas limit" stopgap: a successful free vote
+// returns ALL of its initialGas to the block's GasPool and reports
+// UsedGas == 0, so a block packed with N validator votes has the
+// same effective gas budget for user txs as a block with zero
+// votes. Without this, a 100-validator network would burn
+// ~100 * 30k of every block's gas-limit budget on infrastructure
+// before any user tx got a chance to land.
+func TestFreeVote_DoesNotCountTowardBlockGas(t *testing.T) {
+	alice := common.BytesToAddress(common.FromHex("0x000000000000000000000000000000000000a11c"))
+
+	sdb := newPredeployedState(t, alice)
+	registerValidator(t, sdb, alice)
+
+	const gasLimit = 200_000
+	gasPrice := big.NewInt(1_000_000_000)
+	fundNativeForGas(sdb, alice, gasLimit, gasPrice)
+
+	msg := &Message{
+		From:      alice,
+		To:        &ValidatorOracleAddress,
+		Nonce:     0,
+		Value:     big.NewInt(0),
+		GasLimit:  gasLimit,
+		GasPrice:  gasPrice,
+		GasFeeCap: gasPrice,
+		GasTipCap: gasPrice,
+		Data:      buildSubmitVoteCalldata(big.NewInt(1), big.NewInt(1_000_000_000_000_000_000)),
+	}
+
+	chainCfg := &params.ChainConfig{ChainID: big.NewInt(1337)}
+	blockCtx := vm.BlockContext{
+		CanTransfer: CanTransfer,
+		Transfer:    Transfer,
+		GetHash:     func(uint64) common.Hash { return common.Hash{} },
+		Coinbase:    common.BytesToAddress(common.FromHex("0x000000000000000000000000000000000000c01b")),
+		BlockNumber: big.NewInt(1),
+		Time:        1,
+		GasLimit:    30_000_000,
+		BaseFee:     big.NewInt(0),
+	}
+	txCtx := vm.TxContext{Origin: msg.From, GasPrice: msg.GasPrice}
+	qrvm := vm.NewQRVM(blockCtx, txCtx, sdb, chainCfg, vm.Config{})
+
+	const startingPool uint64 = 30_000_000
+	gp := new(GasPool).AddGas(startingPool)
+
+	result, err := ApplyMessage(qrvm, msg, gp)
+	if err != nil {
+		t.Fatalf("ApplyMessage: %v", err)
+	}
+	if result.Failed() {
+		t.Fatalf("submitVote failed: %v", result.Err)
+	}
+
+	if result.UsedGas != 0 {
+		t.Errorf("free vote result.UsedGas: got %d, want 0", result.UsedGas)
+	}
+	if got := uint64(*gp); got != startingPool {
+		t.Errorf("free vote depleted block gas pool: got %d, want %d", got, startingPool)
 	}
 }
 
