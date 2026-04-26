@@ -304,36 +304,49 @@ func (miner *Miner) fillTransactions(interrupt *atomic.Int32, env *environment) 
 		}
 	}
 
-	// First, partition out price-vote txs (submitVote → oracle).
-	// They must land at the start of the block per the vote-ordering
-	// rule enforced by ValidateBody — committing them ahead of all
-	// other txs ensures we don't accidentally produce an invalid
-	// block. partitionVoteTxs preserves per-account nonce order.
-	localVotes, localOther := partitionVoteTxs(localTxs)
-	remoteVotes, remoteOther := partitionVoteTxs(remoteTxs)
+	// QSD-fork-gated path. Pre-fork the oracle predeploy doesn't
+	// exist, so submitVote is just a regular call to a code-less
+	// account — it goes through the standard tx pipeline with no
+	// special ordering or proposer-vote enforcement.
+	var (
+		localOther  = localTxs
+		remoteOther = remoteTxs
+	)
+	if miner.chainConfig.IsQSD(env.header.Time) {
+		// First, partition out price-vote txs (submitVote → oracle).
+		// They must land at the start of the block per the vote-
+		// ordering rule enforced by ValidateBody — committing them
+		// ahead of all other txs ensures we don't accidentally
+		// produce an invalid block. partitionVoteTxs preserves per-
+		// account nonce order.
+		var localVotes, remoteVotes map[common.Address][]*txpool.LazyTransaction
+		localVotes, localOther = partitionVoteTxs(localTxs)
+		remoteVotes, remoteOther = partitionVoteTxs(remoteTxs)
 
-	// Fill votes first.
-	if len(localVotes) > 0 {
-		txs := newTransactionsByPriceAndNonce(env.signer, localVotes, env.header.BaseFee)
-		if err := miner.commitTransactions(env, txs, interrupt); err != nil {
+		// Fill votes first.
+		if len(localVotes) > 0 {
+			txs := newTransactionsByPriceAndNonce(env.signer, localVotes, env.header.BaseFee)
+			if err := miner.commitTransactions(env, txs, interrupt); err != nil {
+				return err
+			}
+		}
+		if len(remoteVotes) > 0 {
+			txs := newTransactionsByPriceAndNonce(env.signer, remoteVotes, env.header.BaseFee)
+			if err := miner.commitTransactions(env, txs, interrupt); err != nil {
+				return err
+			}
+		}
+		// Proposer-vote rule: if our coinbase is a registered
+		// validator, the block we propose MUST include our own
+		// submitVote tx targeting this block's number. ValidateBody
+		// on every peer enforces this; producing an invalid block
+		// would just get it rejected. Fail fast here — before we
+		// waste cycles on the non-vote tx pool — so the operator
+		// sees a clear error and the scheduler retries on the next
+		// slot once qsdfeeder catches up.
+		if err := ensureProposerVote(env); err != nil {
 			return err
 		}
-	}
-	if len(remoteVotes) > 0 {
-		txs := newTransactionsByPriceAndNonce(env.signer, remoteVotes, env.header.BaseFee)
-		if err := miner.commitTransactions(env, txs, interrupt); err != nil {
-			return err
-		}
-	}
-	// Proposer-vote rule: if our coinbase is a registered validator,
-	// the block we propose MUST include our own submitVote tx
-	// targeting this block's number. ValidateBody on every peer
-	// enforces this; producing an invalid block would just get it
-	// rejected. Fail fast here — before we waste cycles on the
-	// non-vote tx pool — so the operator sees a clear error and the
-	// scheduler retries on the next slot once qsdfeeder catches up.
-	if err := ensureProposerVote(env); err != nil {
-		return err
 	}
 	// Then everything else.
 	if len(localOther) > 0 {

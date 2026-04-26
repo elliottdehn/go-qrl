@@ -606,11 +606,17 @@ func (pool *LegacyPool) local() map[common.Address]types.Transactions {
 // This check is meant as an early check which only needs to be performed once,
 // and does not require the pool mutex to be held.
 func (pool *LegacyPool) validateTxBasics(tx *types.Transaction, local bool) error {
+	// Type-0x04 paymaster transactions are accepted only on chains
+	// where the QSD stability-layer fork has activated by the
+	// current head's timestamp. Pre-fork they're a future format
+	// the chain does not yet understand and must not be admitted.
+	accept := uint8(1 << types.DynamicFeeTxType)
+	if head := pool.currentHead.Load(); head != nil && pool.chainconfig.IsQSD(head.Time) {
+		accept |= 1 << types.PaymasterDynamicFeeTxType
+	}
 	opts := &txpool.ValidationOptions{
-		Config: pool.chainconfig,
-		Accept: 0 |
-			1<<types.DynamicFeeTxType |
-			1<<types.PaymasterDynamicFeeTxType,
+		Config:  pool.chainconfig,
+		Accept:  accept,
 		MaxSize: txMaxSize,
 		MinTip:  pool.gasTip.Load(),
 	}

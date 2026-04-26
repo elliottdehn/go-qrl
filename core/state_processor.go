@@ -71,14 +71,30 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 		signer  = types.MakeSigner(p.config)
 	)
 
+	// At the QSD fork activation block (and every block thereafter,
+	// idempotently), make sure the four stability-layer predeploys
+	// are installed. Networks that bake them into genesis hit the
+	// fast path on the very first probe; networks that activate the
+	// fork mid-chain pay one full install on the activation block
+	// and the fast path forever after.
+	if p.config.IsQSD(header.Time) {
+		if err := InstallQSDPredeploysIfMissing(statedb); err != nil {
+			return nil, nil, 0, fmt.Errorf("qsd predeploy install: %w", err)
+		}
+	}
+
 	// Mirror the chain's PoS validator set into the ValidatorOracle
 	// predeploy via a system call BEFORE executing transactions, so
 	// any submitVote / free-vote machinery in this block sees the
-	// fresh set. No-op when the body carries no validator list (e.g.
-	// blocks built before the engine API was extended to populate it).
-	if vs := block.Validators(); len(vs) > 0 {
-		if err := ProcessSetValidatorSet(vmenv, vs); err != nil {
-			return nil, nil, 0, fmt.Errorf("setValidatorSet system call: %w", err)
+	// fresh set. Gated on the QSD fork: pre-fork blocks have no
+	// ValidatorOracle to mirror into. No-op when the body carries
+	// no validator list (e.g. blocks built before the engine API
+	// was extended to populate it).
+	if p.config.IsQSD(header.Time) {
+		if vs := block.Validators(); len(vs) > 0 {
+			if err := ProcessSetValidatorSet(vmenv, vs); err != nil {
+				return nil, nil, 0, fmt.Errorf("setValidatorSet system call: %w", err)
+			}
 		}
 	}
 

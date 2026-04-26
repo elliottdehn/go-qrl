@@ -407,7 +407,12 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	// votes[from].blockNumber slot will be overwritten by a
 	// successful submitVote(), so any post-execution read would
 	// always show "already voted this block" and grant nothing free.
-	freeVoteCandidate := st.isFreeValidatorVoteTx()
+	// Gated on the QSD fork: pre-fork there's no oracle to vote
+	// into, and isFreeValidatorVoteTx would already return false
+	// (validatorIndex reads as zero on a missing predeploy), but
+	// the explicit guard saves the storage probe and documents the
+	// dependency.
+	freeVoteCandidate := rules.IsQSD && st.isFreeValidatorVoteTx()
 
 	var (
 		ret   []byte

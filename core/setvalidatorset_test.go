@@ -77,7 +77,7 @@ func TestEncodeSetValidatorSetCalldata_EmptyArray(t *testing.T) {
 // for assertions about the resulting on-chain state.
 func applyValidatorSetUpdate(t *testing.T, sdb stateDBLike, validators []common.Address, blockNum uint64) error {
 	t.Helper()
-	chainCfg := &params.ChainConfig{ChainID: big.NewInt(1337)}
+	chainCfg := params.AllDevChainProtocolChanges
 	blockCtx := vm.BlockContext{
 		CanTransfer: CanTransfer,
 		Transfer:    Transfer,

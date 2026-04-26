@@ -89,10 +89,25 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 		return errors.New("validators present in block body but not committed to in header")
 	}
 
-	// Vote-ordering rule: all price-vote txs come before any
-	// non-vote tx. See validateVoteOrdering for the exact predicate.
-	if err := validateVoteOrdering(block.Transactions()); err != nil {
-		return err
+	// QSD-fork-gated body rules. Pre-fork blocks have no oracle to
+	// vote into and no validator set to enforce against, so all of
+	// these are no-ops on legacy blocks. Pre-fork blocks must also
+	// not contain type-0x04 paymaster transactions: that format is
+	// reserved for post-activation chains and reading it pre-fork
+	// would be an out-of-protocol behavior.
+	if v.config.IsQSD(header.Time) {
+		// Vote-ordering rule: all price-vote txs come before any
+		// non-vote tx. See validateVoteOrdering for the exact
+		// predicate.
+		if err := validateVoteOrdering(block.Transactions()); err != nil {
+			return err
+		}
+	} else {
+		for i, tx := range block.Transactions() {
+			if tx.Type() == types.PaymasterDynamicFeeTxType {
+				return fmt.Errorf("paymaster tx (type 0x04) at index %d in pre-QSD-fork block", i)
+			}
+		}
 	}
 
 	// Ancestor block must be known.
@@ -110,17 +125,19 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 	// an active validator carries at least one fresh price vote,
 	// keeping the oracle median moving even when other validators
 	// are silent. See ValidateProposerVote for the predicate.
-	parent := v.bc.GetHeaderByHash(block.ParentHash())
-	if parent != nil {
-		parentState, err := v.bc.StateAt(parent.Root)
-		if err != nil {
-			return fmt.Errorf("proposer vote: load parent state: %w", err)
-		}
-		isValidator := func(addr common.Address) bool {
-			return parentState.GetState(ValidatorOracleAddress, ValidatorIndexStorageSlot(addr)) != (common.Hash{})
-		}
-		if err := ValidateProposerVote(block.Coinbase(), block.NumberU64(), block.Transactions(), types.MakeSigner(v.config), isValidator); err != nil {
-			return err
+	if v.config.IsQSD(header.Time) {
+		parent := v.bc.GetHeaderByHash(block.ParentHash())
+		if parent != nil {
+			parentState, err := v.bc.StateAt(parent.Root)
+			if err != nil {
+				return fmt.Errorf("proposer vote: load parent state: %w", err)
+			}
+			isValidator := func(addr common.Address) bool {
+				return parentState.GetState(ValidatorOracleAddress, ValidatorIndexStorageSlot(addr)) != (common.Hash{})
+			}
+			if err := ValidateProposerVote(block.Coinbase(), block.NumberU64(), block.Transactions(), types.MakeSigner(v.config), isValidator); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

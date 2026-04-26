@@ -321,7 +321,7 @@ func TestFreeVote_DoesNotCountTowardBlockGas(t *testing.T) {
 		Data:      buildSubmitVoteCalldata(big.NewInt(1), big.NewInt(1_000_000_000_000_000_000)),
 	}
 
-	chainCfg := &params.ChainConfig{ChainID: big.NewInt(1337)}
+	chainCfg := params.AllDevChainProtocolChanges
 	blockCtx := vm.BlockContext{
 		CanTransfer: CanTransfer,
 		Transfer:    Transfer,

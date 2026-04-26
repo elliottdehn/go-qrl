@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/theQRL/go-qrl/common"
+	"github.com/theQRL/go-qrl/core/state"
 	"github.com/theQRL/go-qrl/crypto"
 )
 
@@ -169,6 +170,55 @@ func AddQSDStabilityLayer(alloc GenesisAlloc, _ QSDPredeployParams) {
 		}
 		alloc[addr] = ga
 	}
+}
+
+// InstallQSDPredeploysIfMissing installs the QSD stability-layer
+// predeploys (ValidatorOracle, InverseQRL, QSD, PayWithIQRL) into
+// `state` if they are not already present. Used to bring the
+// predeploys live at the QSD fork activation block on chains that
+// did not include them in their genesis alloc.
+//
+// The function is idempotent: it gates on a single GetCodeSize
+// probe of ValidatorOracle, so post-activation blocks pay only one
+// storage read before short-circuiting. Dev networks that bake the
+// predeploys into genesis hit the fast path on every block.
+//
+// Source of truth for the bytecode and storage is the same embedded
+// JSON dump that AddQSDStabilityLayer reads at genesis time, so the
+// fork-activated state is byte-for-byte identical to a fresh
+// genesis install.
+func InstallQSDPredeploysIfMissing(sdb *state.StateDB) error {
+	if sdb.GetCodeSize(ValidatorOracleAddress) > 0 {
+		return nil
+	}
+	dump, err := parseQSDPredeployDump()
+	if err != nil {
+		return fmt.Errorf("qsd predeploy: parse embedded state: %w", err)
+	}
+	for _, addr := range []common.Address{
+		ValidatorOracleAddress,
+		InverseQRLAddress,
+		QSDAddress,
+		PayWithIQRLAddress,
+	} {
+		key := "0x" + common.Bytes2Hex(addr.Bytes())
+		acct, ok := dump[key]
+		if !ok {
+			return fmt.Errorf("qsd predeploy: dump missing %s", key)
+		}
+		ga, err := acct.toGenesisAccount()
+		if err != nil {
+			return fmt.Errorf("qsd predeploy: %s: %w", key, err)
+		}
+		sdb.CreateAccount(addr)
+		sdb.SetCode(addr, ga.Code)
+		for slot, val := range ga.Storage {
+			sdb.SetState(addr, slot, val)
+		}
+		sdb.SetNonce(addr, ga.Nonce)
+		// Predeploys hold no native balance.
+	}
+	return nil
 }
 
 // SeedQSDDevValidator mutates the genesis alloc to install

@@ -84,7 +84,7 @@ func newPredeployedState(t *testing.T, oracleOwner common.Address) *state.StateD
 // execution result so callers can assert on gasUsed / vmerr.
 func applyPaymasterMessage(t *testing.T, sdb *state.StateDB, msg *Message, baseFee *big.Int) *ExecutionResult {
 	t.Helper()
-	chainCfg := &params.ChainConfig{ChainID: big.NewInt(1337)}
+	chainCfg := params.AllDevChainProtocolChanges
 	blockCtx := vm.BlockContext{
 		CanTransfer: CanTransfer,
 		Transfer:    Transfer,
@@ -211,7 +211,7 @@ func TestPaymaster_RejectsNonAllowlistedPaymaster(t *testing.T) {
 		Paymaster: &bogus, // not on allowlist
 	}
 
-	chainCfg := &params.ChainConfig{ChainID: big.NewInt(1337)}
+	chainCfg := params.AllDevChainProtocolChanges
 	blockCtx := vm.BlockContext{
 		CanTransfer: CanTransfer,
 		Transfer:    Transfer,
@@ -254,7 +254,7 @@ func TestPaymaster_RejectsWhenPayerLacksAllowance(t *testing.T) {
 		Paymaster: &PayWithIQRLAddress,
 	}
 
-	chainCfg := &params.ChainConfig{ChainID: big.NewInt(1337)}
+	chainCfg := params.AllDevChainProtocolChanges
 	blockCtx := vm.BlockContext{
 		CanTransfer: CanTransfer,
 		Transfer:    Transfer,
