@@ -27,10 +27,35 @@ operator runbook see [`qsd-deployment.md`](qsd-deployment.md).
 ## 0. Prereqs
 
 - Go 1.24+ on `$PATH`.
+- `git` (and optionally `gh`, the GitHub CLI).
 - `curl` (for one optional sanity check).
 - ~50 MB of free disk for the ephemeral chaindata.
 
-## 1. Build
+## 1. Pull down the PR
+
+The QSD stability layer lives on the `qsd-stability-layer` branch
+of the `elliottdehn/go-qrl` fork
+([PR #1](https://github.com/elliottdehn/go-qrl/pull/1)). Clone that
+branch directly:
+
+```sh
+git clone --branch qsd-stability-layer \
+    https://github.com/elliottdehn/go-qrl
+cd go-qrl
+```
+
+Or, if you have the GitHub CLI installed:
+
+```sh
+gh repo clone elliottdehn/go-qrl
+cd go-qrl
+gh pr checkout 1
+```
+
+Either way, `git status` should show you on `qsd-stability-layer`
+with a clean working tree.
+
+## 2. Build
 
 From the repo root:
 
@@ -42,7 +67,7 @@ go build -o /tmp/qsddemo    ./cmd/qsddemo
 
 All three should exit silently with `$? == 0`.
 
-## 2. Start the dev node
+## 3. Start the dev node
 
 `--dev.period=1` makes the node mine one block per second.
 
@@ -64,7 +89,7 @@ tail -3 /tmp/qsd-demo/gqrl.log
 You should see lines like `Chain head was updated number=N ...`
 ticking forward.
 
-## 3. (Optional) Verify the oracle is live
+## 4. (Optional) Verify the oracle is live
 
 The QRL fork uses the `qrl_` JSON-RPC namespace.
 
@@ -82,7 +107,7 @@ echo
 
 Expected: `0x...0de0b6b3a7640000` (= 1e18 = $1.00, the seeded vote).
 
-## 4. Start the price-feeder daemon (keyed mode)
+## 5. Start the price-feeder daemon (keyed mode)
 
 The proposer-vote rule requires every block produced by an active
 validator to contain that validator's own `submitVote` tx. In a real
@@ -111,7 +136,7 @@ Expected: lines like `submitted vote: tx=0x... forBlock=N ...` once
 per second. The submitVote txs are free (entire fee refunded by
 consensus) but cover the proposer-vote requirement.
 
-## 5. Run the full QSD economic flow
+## 6. Run the full QSD economic flow
 
 `qsddemo` walks through the user-facing flow against the live node.
 It generates a fresh ephemeral wallet (so it doesn't race with
@@ -188,7 +213,7 @@ What just happened, step by step:
    slice of the pool (~0.226 QRL + ~0.274 iQRL, sized by the
    USD-value formula).
 
-## 6. Tear down
+## 7. Tear down
 
 ```sh
 kill $(cat /tmp/qsd-demo/feeder.pid)
