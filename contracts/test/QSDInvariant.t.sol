@@ -46,12 +46,14 @@ contract QSDHandler is Test {
 
     function deposit(uint256 actorSeed, uint256 qrlAmount, uint256 iqrlAmount) external {
         address actor = _pickActor(actorSeed);
-        qrlAmount = bound(qrlAmount, 0, 1e24);
-        iqrlAmount = bound(iqrlAmount, 0, 1e24);
-        if (qrlAmount == 0 && iqrlAmount == 0) return;
+        qrlAmount = bound(qrlAmount, 1, 1e24);
+        // iqrlAmount serves as maxIqrlIn (slippage cap on iQRL leg);
+        // pad it generously so the pool-ratio match almost always
+        // succeeds on the symmetric-deposit branch.
+        iqrlAmount = bound(iqrlAmount, qrlAmount, 1e26);
 
         vm.prank(actor);
-        try qsd.deposit{value: qrlAmount}(iqrlAmount, 0) returns (uint256) {
+        try qsd.deposit{value: qrlAmount}(iqrlAmount, 0) returns (uint256, uint256) {
             depositCount++;
         } catch {}
     }

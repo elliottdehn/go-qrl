@@ -112,67 +112,75 @@ contract QSD is ERC20, ReentrancyGuard {
     ///         receive QSD equal to the increase in the pool's
     ///         AM-GM-derived USD floor:
     ///
-    ///             qsdMinted = 2 * (sqrt(k_new) - sqrt(k_old))
+    ///             qsdMinted = totalSupply * qrlIn / poolQRL
     ///
-    ///         where k = poolQRL * poolIQRL. By construction this
-    ///         exactly preserves the invariant
+    ///         which makes both reserves and supply scale by the
+    ///         same factor (1 + qrlIn/poolQRL). This exactly
+    ///         preserves the invariant
     ///
     ///             2 * sqrt(k) == totalSupply()
     ///
-    ///         after every deposit, regardless of asymmetry.
-    /// @param  iqrlAmount Amount of iQRL to deposit (may be zero if
-    ///                    msg.value > 0). The QRL leg is supplied as
-    ///                    msg.value and may be zero if iqrlAmount > 0.
-    /// @param  minQsdOut  Minimum QSD the caller is willing to accept;
-    ///                    revert if computed amount is below this.
+    ///         after every deposit (modulo floor-rounding wei).
+    ///
+    ///         Deposits MUST be symmetric at the pool's current
+    ///         marginal ratio. The caller sends QRL via msg.value;
+    ///         the contract pulls the corresponding iQRL via
+    ///         transferFrom. There is no path to deposit at an
+    ///         asymmetric ratio: it would mint less QSD than the
+    ///         depositor's contribution and silently donate the
+    ///         shortfall to existing holders. Users with imbalanced
+    ///         inventory (e.g. extra iQRL) must swap through the
+    ///         pool to balance before depositing.
+    /// @param  maxIqrlIn  Slippage cap on the iQRL leg. The contract
+    ///                    pulls (msg.value * poolIQRL / poolQRL)
+    ///                    iQRL; if that exceeds maxIqrlIn the tx
+    ///                    reverts. Protects against pool-ratio
+    ///                    shifts between submission and execution.
+    /// @param  minQsdOut  Minimum QSD the caller is willing to
+    ///                    accept; revert if computed amount is
+    ///                    below this.
     /// @return qsdMinted  Amount of QSD minted to the caller.
-    /// @dev    Symmetric deposits at the pool's marginal price yield
-    ///         qsdMinted = total USD value of the deposit. Asymmetric
-    ///         deposits yield strictly less; the shortfall accrues to
-    ///         existing holders as additional collateral. This is the
-    ///         standard CPMM LP-minting formula and is oracle-
-    ///         independent (deposits work even when the oracle is
-    ///         unhealthy).
-    function deposit(uint256 iqrlAmount, uint256 minQsdOut)
+    /// @return iqrlIn     Amount of iQRL pulled from the caller.
+    function deposit(uint256 maxIqrlIn, uint256 minQsdOut)
         external
         payable
         nonReentrant
-        returns (uint256 qsdMinted)
+        returns (uint256 qsdMinted, uint256 iqrlIn)
     {
-        uint256 qrlAmount = msg.value;
-        if (qrlAmount == 0 && iqrlAmount == 0) revert ZeroAmount();
+        uint256 qrlIn = msg.value;
+        if (qrlIn == 0) revert ZeroAmount();
 
-        uint256 newPoolQRL = poolQRL + qrlAmount;
-        uint256 newPoolIQRL = poolIQRL + iqrlAmount;
+        uint256 supply = totalSupply();
+        if (supply == 0) {
+            // Bootstrap: first depositor sets the initial pool
+            // ratio. Use both legs at face value, mint QSD via the
+            // CPMM-LP formula so 2*sqrt(k) == totalSupply at the
+            // end. maxIqrlIn doubles as the iQRL contribution
+            // amount in this branch.
+            iqrlIn = maxIqrlIn;
+            if (iqrlIn == 0) revert ZeroAmount();
+            qsdMinted = 2 * Math.sqrt(qrlIn * iqrlIn);
+        } else {
+            // Symmetric deposit at pool's marginal ratio.
+            iqrlIn = (qrlIn * poolIQRL) / poolQRL;
+            if (iqrlIn > maxIqrlIn) revert SlippageExceeded(iqrlIn, maxIqrlIn);
+            // Pool grows by factor (qrlIn / poolQRL); supply grows
+            // by the same factor.
+            qsdMinted = (supply * qrlIn) / poolQRL;
+        }
 
-        uint256 sqrtKOld = Math.sqrt(poolQRL * poolIQRL);
-        uint256 sqrtKNew = Math.sqrt(newPoolQRL * newPoolIQRL);
-
-        // sqrt is monotonic; new pool is element-wise >= old pool, so
-        // sqrtKNew >= sqrtKOld. Underflow on the subtraction would
-        // indicate a math bug.
-        assert(sqrtKNew >= sqrtKOld);
-
-        qsdMinted = 2 * (sqrtKNew - sqrtKOld);
-
-        // Reject silent-donation cases (e.g., single-sided deposit
-        // into an empty pool, or any deposit that would mint zero).
         if (qsdMinted == 0) revert ZeroAmount();
         if (qsdMinted < minQsdOut) revert SlippageExceeded(qsdMinted, minQsdOut);
 
-        if (iqrlAmount > 0) iqrl.safeTransferFrom(msg.sender, address(this), iqrlAmount);
+        iqrl.safeTransferFrom(msg.sender, address(this), iqrlIn);
 
-        poolQRL = newPoolQRL;
-        poolIQRL = newPoolIQRL;
+        poolQRL += qrlIn;
+        poolIQRL += iqrlIn;
 
         _mint(msg.sender, qsdMinted);
-
-        // After deposit, 2*sqrt(k) == totalSupply() in exact arithmetic.
-        // With floor-sqrt rounding, the invariant 2*sqrt(k) >= supply
-        // still holds (supply may trail by at most O(1) per deposit).
         _assertSolvent();
 
-        emit Deposited(msg.sender, qrlAmount, iqrlAmount, qsdMinted);
+        emit Deposited(msg.sender, qrlIn, iqrlIn, qsdMinted);
     }
 
     /// @notice Burn `qsdAmount` QSD and receive a pro-rata slice of
@@ -373,34 +381,25 @@ contract QSD is ERC20, ReentrancyGuard {
         return (V * SCALE) / supply;
     }
 
-    /// @notice Quote QSD output for a given (qrlAmount, iqrlAmount)
-    ///         deposit pair without executing the deposit.
-    function quoteDeposit(uint256 qrlAmount, uint256 iqrlAmount)
+    /// @notice Quote the symmetric deposit for a given QRL
+    ///         contribution: returns the iQRL the contract would
+    ///         pull and the QSD that would be minted at the current
+    ///         pool state. Mirrors `deposit`'s post-bootstrap path
+    ///         exactly, so callers can size `maxIqrlIn` against the
+    ///         returned `iqrlIn` plus their tolerance for ratio
+    ///         drift.
+    /// @dev    Reverts when the pool is empty (totalSupply == 0):
+    ///         the marginal ratio is undefined during bootstrap, so
+    ///         no quote is meaningful.
+    function quoteDeposit(uint256 qrlAmount)
         external
         view
-        returns (uint256 qsdMinted)
+        returns (uint256 iqrlIn, uint256 qsdMinted)
     {
-        uint256 sqrtKOld = Math.sqrt(poolQRL * poolIQRL);
-        uint256 sqrtKNew = Math.sqrt((poolQRL + qrlAmount) * (poolIQRL + iqrlAmount));
-        qsdMinted = 2 * (sqrtKNew - sqrtKOld);
-    }
-
-    /// @notice Quote the symmetric (QRL, iQRL) pair that would mint
-    ///         exactly `qsdAmount` QSD at the current oracle price
-    ///         with no slippage. Useful for UIs that want a
-    ///         "deposit-this-pair-to-get-N-QSD" hint.
-    /// @dev    Reverts if the oracle is unhealthy; a stale or zero
-    ///         price would produce misleading quotes.
-    function quoteSymmetricDeposit(uint256 qsdAmount)
-        external
-        view
-        returns (uint256 qrlAmount, uint256 iqrlAmount)
-    {
-        if (!oracle.healthy()) revert OracleUnhealthy();
-        uint256 p = oracle.price();
-        uint256 halfUsd = qsdAmount / 2;
-        qrlAmount = (halfUsd * SCALE) / p;
-        iqrlAmount = (halfUsd * p) / SCALE;
+        uint256 supply = totalSupply();
+        if (supply == 0) revert EmptyPool();
+        iqrlIn = (qrlAmount * poolIQRL) / poolQRL;
+        qsdMinted = (supply * qrlAmount) / poolQRL;
     }
 
     // ------------------------------------------------------------------

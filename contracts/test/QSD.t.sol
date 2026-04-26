@@ -41,11 +41,13 @@ contract QSDTest is Test {
     // ------------------------------------------------------------------
 
     function test_FirstDeposit_Symmetric_AtPeg() public {
-        // Symmetric at p=$1: deposit (1, 1), expect 2 QSD minted.
+        // Bootstrap: first depositor sets the initial ratio. (1, 1)
+        // mints 2*sqrt(1*1) = 2 QSD.
         vm.prank(alice);
-        uint256 minted = qsd.deposit{value: ONE}(ONE, 0);
+        (uint256 minted, uint256 iqrlIn) = qsd.deposit{value: ONE}(ONE, 0);
 
         assertEq(minted, 2 * ONE, "qsd minted");
+        assertEq(iqrlIn, ONE);
         assertEq(qsd.balanceOf(alice), 2 * ONE);
         assertEq(qsd.poolQRL(), ONE);
         assertEq(qsd.poolIQRL(), ONE);
@@ -53,42 +55,57 @@ contract QSDTest is Test {
         assertEq(2 * Math.sqrt(qsd.poolQRL() * qsd.poolIQRL()), qsd.totalSupply());
     }
 
-    function test_Deposit_Asymmetric_MintsLessThanUsdValue() public {
-        // Empty pool. Single-sided deposit: stays at k=0, qsdMinted == 0
-        // → ZeroAmount revert.
+    function test_Deposit_PullsIqrlAtPoolRatio() public {
+        // Bootstrap pool at 2:1.
         vm.prank(alice);
-        vm.expectRevert(QSD.ZeroAmount.selector);
-        qsd.deposit{value: ONE}(0, 0);
+        qsd.deposit{value: 2 * ONE}(ONE, 0); // pool (2, 1)
 
-        // After a balanced first deposit, asymmetric deposits succeed
-        // but mint less than the asymmetric leg's USD value.
-        vm.prank(alice);
-        qsd.deposit{value: ONE}(ONE, 0);
-
-        // Deposit only QRL: at the pool's marginal price the user is
-        // pushing the pool away from balance, so they get less QSD
-        // than the deposit's USD value at oracle price.
-        uint256 supplyBefore = qsd.totalSupply();
+        // Bob's subsequent deposit must match the 2:1 ratio. Sending
+        // 1 QRL pulls 0.5 iQRL.
         vm.prank(bob);
-        uint256 minted = qsd.deposit{value: ONE}(0, 0);
-        uint256 oracleUsdValue = ONE; // 1 QRL at p=$1 = $1
+        (uint256 minted, uint256 iqrlIn) = qsd.deposit{value: ONE}(ONE, 0);
 
-        assertGt(minted, 0);
-        assertLt(minted, oracleUsdValue, "asymmetric mints less than USD");
-        assertEq(qsd.totalSupply(), supplyBefore + minted);
+        assertEq(iqrlIn, ONE / 2, "iqrl pulled at pool ratio");
+        // Pool grew by factor (1/2 = qrlIn/poolQRL), so supply grows
+        // by the same factor: minted = totalSupplyBefore * 1/2.
+        // Pool was at (2, 1) → totalSupply ≈ 2*sqrt(2). Half of that
+        // is sqrt(2) ≈ 1.414e18.
+        assertApproxEqRel(minted, 1414213562373095049, 1e15);
+        assertEq(qsd.poolQRL(), 3 * ONE);
+        assertEq(qsd.poolIQRL(), ONE + ONE / 2);
         assertTrue(qsd.checkInvariants());
     }
 
-    function test_Deposit_SlippageRevert() public {
+    function test_Deposit_AsymmetricRejected_PostBootstrap() public {
+        // Bootstrap to (1, 1).
         vm.prank(alice);
-        vm.expectRevert(); // SlippageExceeded
-        qsd.deposit{value: ONE}(ONE, 3 * ONE); // expect 2, demand 3
+        qsd.deposit{value: ONE}(ONE, 0);
+
+        // Bob tries to deposit 1 QRL but caps iQRL at 0. The contract
+        // tries to pull 1 iQRL (matching pool ratio); slippage cap
+        // exceeded, revert. There is no path to deposit a single-
+        // sided QRL contribution.
+        vm.prank(bob);
+        vm.expectRevert(); // SlippageExceeded(1e18, 0)
+        qsd.deposit{value: ONE}(0, 0);
     }
 
-    function test_Deposit_RevertsOnEmptyEmpty() public {
+function test_Deposit_SlippageRevert_OnQsdOut() public {
+        vm.prank(alice);
+        vm.expectRevert(); // SlippageExceeded on minQsdOut
+        qsd.deposit{value: ONE}(ONE, 3 * ONE); // bootstrap mints 2, demand 3
+    }
+
+    function test_Deposit_RevertsOnZeroQrl() public {
         vm.prank(alice);
         vm.expectRevert(QSD.ZeroAmount.selector);
         qsd.deposit{value: 0}(0, 0);
+    }
+
+    function test_Deposit_RevertsOnZeroIqrlAtBootstrap() public {
+        vm.prank(alice);
+        vm.expectRevert(QSD.ZeroAmount.selector);
+        qsd.deposit{value: ONE}(0, 0); // bootstrap with iqrl=0 disallowed
     }
 
     // ------------------------------------------------------------------
@@ -222,19 +239,13 @@ contract QSDTest is Test {
         assertTrue(qsd.checkInvariants());
     }
 
-    function test_OracleUnhealthy_BlocksQuoteSymmetricDeposit() public {
-        oracle.setHealthy(false);
-
-        vm.expectRevert(QSD.OracleUnhealthy.selector);
-        qsd.quoteSymmetricDeposit(ONE);
-    }
-
     function test_OracleUnhealthy_DepositStillWorks() public {
-        // Deposits use the sqrt-k LP formula — fully oracle-independent.
+        // Deposits derive iqrlIn and qsdMinted from pool state only;
+        // fully oracle-independent.
         oracle.setHealthy(false);
 
         vm.prank(alice);
-        uint256 minted = qsd.deposit{value: ONE}(ONE, 0);
+        (uint256 minted,) = qsd.deposit{value: ONE}(ONE, 0);
         assertEq(minted, 2 * ONE);
         assertTrue(qsd.checkInvariants());
     }
@@ -257,8 +268,9 @@ contract QSDTest is Test {
 
         oracle.setHealthy(false);
 
-        uint256 quote = qsd.quoteDeposit(ONE, ONE);
-        assertGt(quote, 0);
+        (uint256 iqrlIn, uint256 qsdMinted) = qsd.quoteDeposit(ONE);
+        assertGt(qsdMinted, 0);
+        assertEq(iqrlIn, ONE); // 1:1 pool ratio
     }
 
     function test_Redeem_FloorAtDollarValue() public {
@@ -298,7 +310,7 @@ contract QSDTest is Test {
         uint256 iIn = bound(uint256(iqrlIn), 1e6, 1e24);
 
         vm.prank(alice);
-        uint256 minted = qsd.deposit{value: qIn}(iIn, 0);
+        (uint256 minted,) = qsd.deposit{value: qIn}(iIn, 0);
 
         assertGt(minted, 0);
         assertTrue(qsd.checkInvariants());

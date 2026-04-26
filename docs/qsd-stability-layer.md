@@ -59,7 +59,30 @@ per-deposit contributions. Concretely:
 ```
 
 where `k` is the CPMM product of pool reserves. The contract asserts
-this invariant on every state mutation.
+this invariant on every state mutation. With symmetric-only deposits
+and pro-rata redemption (below), the inequality is exactly tight at
+the pool's marginal price and only relaxes off-marginal due to
+floor-rounding wei.
+
+### Deposit: symmetric-only at pool ratio
+
+`QSD.deposit(maxIqrlIn, minQsdOut) payable` accepts QRL via
+`msg.value` and pulls `iqrlIn = qrlIn · poolIQRL / poolQRL` iQRL
+from the caller via `transferFrom`. Mints
+`qsdMinted = totalSupply · qrlIn / poolQRL` QSD. The result: both
+reserves and supply scale by the same factor `(1 + qrlIn /
+poolQRL)`, leaving `2·sqrt(k) / totalSupply` invariant.
+
+There is no path to deposit at an asymmetric ratio. A user with
+imbalanced inventory (e.g. extra iQRL) must swap through the pool
+to balance before depositing; this consumes CPMM slippage rather
+than silently donating value to existing QSD holders.
+
+The `maxIqrlIn` parameter caps the iQRL the contract can pull,
+protecting against pool-ratio shifts between transaction
+submission and execution. The first deposit (bootstrap, when
+`totalSupply == 0`) takes both legs at face value and mints
+`2·sqrt(qrlIn · iqrlIn)` QSD, setting the initial pool ratio.
 
 ### Redemption: oracle-independent, pro-rata
 
@@ -71,20 +94,18 @@ delay.
 USD value of a redemption slice is `(q / totalSupply) · V` where
 `V = A·p + B/p` is the pool's USD value at market price `p`. By
 the solvency invariant `V ≥ 2·sqrt(k) ≥ totalSupply`, so this is
-always at least `q` dollars. Equality holds only when the pool
-sits at its symmetric-balanced marginal-price state; any swap or
-asymmetric deposit pushes V above `totalSupply` (call it "slack")
-and pro-rata redemption distributes that slack to redeemers
-continuously rather than letting it accumulate indefinitely in
-the pool.
+always at least `q` dollars. Equality holds when the pool sits at
+its marginal price (the natural attractor under arbitrage); off-
+marginal redemptions earn slightly more than `q` from the
+convexity of `V(p) = A·p + B/p`, but in efficient-market
+equilibrium arbitrage closes that gap.
 
-QSD is therefore a yield-bearing share of the pool with a strict
-$1 floor, not a strict $1-pegged stablecoin. Holders never receive
-less than $1 of value per QSD on redemption; long-term holders see
-per-token value drift upward as the pool absorbs swap volume. The
-crucial liveness property: redemption has no dependency on the
-oracle or on the validator set, so even a complete oracle outage
-leaves holders able to exit at full pool-share value.
+QSD is therefore a strict-floor stablecoin: per-token redemption
+value is approximately $1 in equilibrium and never less than $1
+in any state. The crucial liveness property: redemption has no
+dependency on the oracle or on the validator set, so even a
+complete oracle outage leaves holders able to exit at full pool-
+share value.
 
 ## Consensus-layer rules
 
