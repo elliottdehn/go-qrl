@@ -58,9 +58,13 @@ func ProcessSetValidatorSet(qrvm *vm.QRVM, validators []common.Address) error {
 }
 
 // maxValidatorSetSize must match MAX_VALIDATORS in
-// src/ValidatorOracle.sol. Pinned here to fail fast on absurd input
-// before the EVM runs out of gas inside the diff loop.
-const maxValidatorSetSize = 100
+// contracts/src/ValidatorOracle.sol. Pinned here to fail fast on
+// absurd input before the EVM runs out of gas inside the diff
+// loop. The 2625 ceiling reflects the chain's economic max
+// (max_supply / min_stake), so it's effectively non-binding;
+// quickselect keeps the per-block median compute O(N) at this
+// scale, which fits comfortably in QRL's 60s slot.
+const maxValidatorSetSize = 2625
 
 // encodeSetValidatorSetCalldata produces the ABI calldata for
 //

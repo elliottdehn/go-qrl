@@ -22,9 +22,14 @@ contract ValidatorOracle is IPriceOracle {
     ///         hooks on this chain (see PayWithIQRL).
     address public constant SYSTEM_CALLER = 0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE;
 
-    /// @notice Upper bound on validator-set size. Bounds the median
-    ///         computation cost (insertion sort on N elements).
-    uint256 public constant MAX_VALIDATORS = 100;
+    /// @notice Upper bound on validator-set size. Set to the maximum
+    ///         validator count the chain can ever reach given QRL's
+    ///         max supply and minimum stake (~2625 = max_supply /
+    ///         min_stake), so this cap is effectively non-binding in
+    ///         steady state. The chain's 60s block time absorbs the
+    ///         per-block O(N) median compute (quickselect) at this
+    ///         scale comfortably.
+    uint256 public constant MAX_VALIDATORS = 2625;
 
     /// @notice A vote is considered stale if it was posted more than
     ///         `voteStalenessBlocks` blocks ago. Configured at
@@ -271,19 +276,56 @@ contract ValidatorOracle is IPriceOracle {
         });
     }
 
+    /// @dev Median via quickselect. O(N) average, O(N^2) worst case
+    ///      on adversarial pivot order. The N^2 fallback is the same
+    ///      asymptotic as the previous insertion-sort implementation,
+    ///      so this is a strict improvement at no risk. Average-case
+    ///      linearity is what makes large validator sets (up to
+    ///      MAX_VALIDATORS = 2625) computationally feasible per
+    ///      block.
+    ///
+    ///      For odd n we pick the (n/2)-th smallest. For even n we
+    ///      need both middle values; quickselect for the upper one
+    ///      partitions the array so the lower middle is the max of
+    ///      the prefix [0, n/2-1], which we compute in a single
+    ///      linear scan.
     function _median(uint256[] memory prices, uint256 n) internal pure returns (uint256) {
-        for (uint256 i = 1; i < n; i++) {
-            uint256 key = prices[i];
-            uint256 j = i;
-            while (j > 0 && prices[j - 1] > key) {
-                prices[j] = prices[j - 1];
-                unchecked { j--; }
-            }
-            prices[j] = key;
-        }
         if (n % 2 == 1) {
-            return prices[n / 2];
+            return _quickselect(prices, n, n / 2);
         }
-        return (prices[n / 2 - 1] + prices[n / 2]) / 2;
+        uint256 upper = _quickselect(prices, n, n / 2);
+        uint256 lower = prices[0];
+        for (uint256 i = 1; i < n / 2; i++) {
+            if (prices[i] > lower) lower = prices[i];
+        }
+        return (lower + upper) / 2;
+    }
+
+    /// @dev Iterative Lomuto-partition quickselect. Returns the
+    ///      k-th smallest element of `a[0..n-1]` (k is 0-indexed),
+    ///      mutating the array as a side effect. Caller passes a
+    ///      fresh copy from _freshPrices each call, so the mutation
+    ///      is invisible to outside observers.
+    function _quickselect(uint256[] memory a, uint256 n, uint256 k) internal pure returns (uint256) {
+        uint256 lo = 0;
+        uint256 hi = n - 1;
+        while (lo < hi) {
+            uint256 pivot = a[hi];
+            uint256 store = lo;
+            for (uint256 i = lo; i < hi; i++) {
+                if (a[i] < pivot) {
+                    (a[i], a[store]) = (a[store], a[i]);
+                    unchecked { store++; }
+                }
+            }
+            (a[hi], a[store]) = (a[store], a[hi]);
+            if (store == k) return a[store];
+            if (store > k) {
+                hi = store - 1;
+            } else {
+                lo = store + 1;
+            }
+        }
+        return a[lo];
     }
 }
