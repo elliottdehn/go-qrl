@@ -2,8 +2,11 @@
 
 The QSD stability layer is a set of four on-chain primitives plus a
 small set of consensus-layer rules that together implement a QRL-
-native, dollar-denominated stablecoin and an iQRL-denominated fee
-path.
+native, dollar-denominated **long-volatility stablecoin** and an
+iQRL-denominated fee path. QSD is not algorithmic: nothing in the
+layer mints QRL to defend a peg. The peg is supported by a structural
+arbitrage running through the QSD pool itself (see [Load-bearing
+axioms](#load-bearing-axioms)).
 
 The whole layer is gated behind a single fork flag (`QSDTime`). On
 chains where the flag is unset or hasn't activated yet, the rules
@@ -16,6 +19,77 @@ This document describes the layer at the level a node operator or
 deploy-script author needs. The protocol-level rationale lives in the
 QRL grant proposal. For a hands-on walkthrough that runs the full
 flow against a dev node, see [`qsd-demo.md`](qsd-demo.md).
+
+## Load-bearing axioms
+
+Two design properties carry the weight of the stability claim. Every
+mechanism below should be read against them; every proposed change
+should be checked against them first.
+
+### 1. No reflexive QRL minting
+
+QRL supply is monotone: it is burned to mint iQRL, and never minted
+to support a peg, a redemption, or a recovery action. Nothing in the
+stability layer can create new QRL.
+
+This is the architectural property that distinguishes QSD from
+algorithmic stablecoins. The consequences:
+
+- **Stakers gain monotone share.** As iQRL is minted (gas demand) and
+  burned (paymaster path), QRL is removed from circulation. Active
+  capital's stake share grows across all volatility regimes.
+- **Redemption is bounded by pool composition, not by promise.** A
+  QSD holder is paid out a pro-rata slice of `(poolQRL, poolIQRL)`.
+  No mint, no IOU, no socialized loss path. The contract cannot
+  promise more than the pool contains.
+- **Stress failure is bounded drift, not collapse.** In a regime
+  where the pool depletes one leg, redemptions still pay out exactly
+  what's there. A reflexive-mint design would convert that bounded
+  drift into uncapped supply expansion; QSD cannot.
+
+Any future mechanism that would require minting QRL to defend a peg,
+top up a reserve, or unwind a position is rejected by construction,
+even where it would deliver a stronger strict-$1 claim. The stricter
+claim is not worth the property it would cost.
+
+### 2. Long-vol demand is the hard arbitrage
+
+A persistent iQRL discount creates a structural long-volatility
+position: paired QRL + iQRL has USD value `V(p) = A·p + B/p`,
+convex everywhere with positive gamma. A holder who delta-hedges
+through the QSD pool captures realized variance over any path. The
+QSD pool itself is the optimal rebalancing venue: zero-fee, always-
+live, depth scaling with stake, no intermediary.
+
+The consequences:
+
+- **The peg is supported by a structural mechanism, not soft anchors
+  alone.** Discount-closing demand comes from participants who
+  extract positive expected value over realistic price paths, not
+  from speculation that might or might not arrive.
+- **The AMM-burn mechanism and the long-vol arbitrage are the same
+  thing observed from two angles.** Vol opens spreads; arbitrageurs
+  swap to close them; swap activity captures gamma AND burns iQRL
+  through the paymaster path. There are not two restoring forces;
+  there is one, and it runs continuously through existing
+  infrastructure.
+- **The bar for the arbitrage to fail is high.** It requires a
+  regime simultaneously degenerate in volatility, fee-payer demand,
+  and rebalancing actor presence. Outside that regime the discount
+  cannot survive.
+
+This axiom is what lets QSD claim that any persistent discount is
+mechanically closed, rather than merely "should close in normal
+conditions."
+
+### How the axioms compose
+
+Together the two axioms give the layer its character: the peg cannot
+collapse via reflexive supply expansion (axiom 1), and any drift
+toward a discount creates an executable arbitrage that closes it
+(axiom 2). The truthful failure mode is bounded canonical-vs-market
+drift in degenerate regimes, not a reflexive minting spiral and not
+an unbounded collapse.
 
 ## Components
 
@@ -91,21 +165,28 @@ submission and execution. The first deposit (bootstrap, when
 verifiable on-chain claim that no external feed can corrupt or
 delay.
 
-USD value of a redemption slice is `(q / totalSupply) · V` where
-`V = A·p + B/p` is the pool's USD value at market price `p`. By
-the solvency invariant `V ≥ 2·sqrt(k) ≥ totalSupply`, so this is
-always at least `q` dollars. Equality holds when the pool sits at
-its marginal price (the natural attractor under arbitrage); off-
-marginal redemptions earn slightly more than `q` from the
-convexity of `V(p) = A·p + B/p`, but in efficient-market
-equilibrium arbitrage closes that gap.
+USD value of a redemption slice, evaluated at canonical price `p`,
+is `(q / totalSupply) · V` where `V = A·p + B/p` is the pool's USD
+value. By the solvency invariant `V ≥ 2·sqrt(k) ≥ totalSupply`,
+this is always at least `q` canonical dollars. Equality holds when
+the pool sits at its marginal price (the natural attractor under
+arbitrage); off-marginal slices earn slightly more from the
+convexity of `V(p) = A·p + B/p`.
 
-QSD is therefore a strict-floor stablecoin: per-token redemption
-value is approximately $1 in equilibrium and never less than $1
-in any state. The crucial liveness property: redemption has no
-dependency on the oracle or on the validator set, so even a
-complete oracle outage leaves holders able to exit at full pool-
-share value.
+QSD is a long-volatility stablecoin: per-token redemption is at
+least canonical-$1 in any state and converges to $1 in equilibrium.
+The strict floor is canonical, not market. In stress regimes where
+iQRL trades below `1/p`, a redemption slice realizes less than $1
+when the iQRL leg is sold immediately at the pool's stressed mid;
+holding the slice through the pool's mean-reversion (axiom 2,
+above) realizes the canonical value. This is honest canonical-vs-
+market drift, bounded by the long-vol arbitrage that closes it,
+and is the failure mode the design accepts in exchange for the no-
+reflexive-minting property (axiom 1).
+
+The crucial liveness property: redemption has no dependency on the
+oracle or on the validator set, so even a complete oracle outage
+leaves holders able to exit at full pool-share value.
 
 ## Consensus-layer rules
 
