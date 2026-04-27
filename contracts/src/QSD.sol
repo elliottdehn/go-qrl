@@ -14,6 +14,12 @@ import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 ///      QSD's address in its constructor, so QSD cannot directly
 ///      import the contract type.
 interface IYieldQSD {
+    /// Mint yQSD 1:1 alongside QSD on deposit.
+    function issueTo(address to, uint256 amount) external;
+    /// Burn yQSD 1:1 alongside QSD on redemption. Reverts if the
+    /// redeemer's yQSD balance is insufficient.
+    function redeemFrom(address from, uint256 amount) external;
+    /// Route an iQRL stream to yQSD holders pro-rata.
     function distribute(uint256 amount) external;
 }
 
@@ -315,6 +321,10 @@ contract QSD is ERC20, ReentrancyGuard {
         poolIQRL += iqrlIn;
 
         _mint(msg.sender, qsdMinted);
+        // Co-mint the yield claim 1:1 with QSD. Only the depositor
+        // receives yQSD; secondary buyers of QSD do not have yield
+        // rights and cannot redeem unless they acquire matching yQSD.
+        yieldQsd.issueTo(msg.sender, qsdMinted);
         _assertSolvent();
 
         emit Deposited(msg.sender, qrlIn, iqrlIn, qsdMinted);
@@ -368,6 +378,10 @@ contract QSD is ERC20, ReentrancyGuard {
         assert(iqrlReturned <= poolIQRL);
 
         _burn(msg.sender, qsdAmount);
+        // Burn the matching yQSD. Reverts if the redeemer doesn't
+        // have at least qsdAmount yQSD; this enforces the 1:1
+        // invariant between QSD and yQSD outstanding.
+        yieldQsd.redeemFrom(msg.sender, qsdAmount);
 
         poolQRL -= qrlReturned;
         poolIQRL -= iqrlReturned;

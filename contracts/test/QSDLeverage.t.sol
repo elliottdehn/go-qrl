@@ -102,6 +102,115 @@ contract QSDLeverageTest is Test {
         assertEq(qsd.leverageRateBps(), 1200, "min rate at u=0");
     }
 
+    // ------------------------------------------------------------------
+    // Co-mint invariant: yQSD issued 1:1 with QSD on deposit, and
+    // required for redemption. Validates the principal/yield separation
+    // architecture across the full deposit → redeem cycle.
+    // ------------------------------------------------------------------
+
+    function test_Deposit_CoMintsYieldClaim() public {
+        // Bob deposits and mints QSD. Same-block, his yQSD balance
+        // should equal his QSD balance.
+        uint256 qsdBefore  = qsd.balanceOf(bob);
+        uint256 yqsdBefore = yqsd.balanceOf(bob);
+        vm.prank(bob);
+        (uint256 qsdMinted, ) = qsd.deposit{value: 100 * ONE}(100 * ONE, 0);
+
+        assertEq(qsd.balanceOf(bob)  - qsdBefore,  qsdMinted, "qsd minted to bob");
+        assertEq(yqsd.balanceOf(bob) - yqsdBefore, qsdMinted, "yqsd co-minted to bob");
+    }
+
+    function test_Redeem_RequiresMatchingYieldClaim() public {
+        vm.prank(bob);
+        (uint256 qsdMinted, ) = qsd.deposit{value: 100 * ONE}(100 * ONE, 0);
+
+        // Bob transfers his yQSD away; he no longer has it.
+        vm.prank(bob);
+        yqsd.transfer(carol, qsdMinted);
+        assertEq(yqsd.balanceOf(bob), 0);
+        assertEq(qsd.balanceOf(bob), qsdMinted, "qsd unchanged");
+
+        // Bob attempts redeem. yQSD shortfall reverts the call.
+        vm.prank(bob);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                YieldQSD.InsufficientYieldClaim.selector,
+                bob,
+                qsdMinted,
+                0
+            )
+        );
+        qsd.redeem(qsdMinted);
+
+        // Carol cannot redeem either (she has no QSD), but for the
+        // QSD-side balance reason, not the yQSD-side reason. Skip.
+
+        // Bob reacquires yQSD, then redeem succeeds.
+        vm.prank(carol);
+        yqsd.transfer(bob, qsdMinted);
+        vm.prank(bob);
+        (uint256 qrlOut, uint256 iqrlOut) = qsd.redeem(qsdMinted);
+        assertGt(qrlOut, 0);
+        assertGt(iqrlOut, 0);
+
+        // Both QSD and yQSD now zero for bob.
+        assertEq(qsd.balanceOf(bob), 0);
+        assertEq(yqsd.balanceOf(bob), 0);
+    }
+
+    function test_Redeem_BurnsYieldClaim() public {
+        vm.prank(bob);
+        (uint256 qsdMinted, ) = qsd.deposit{value: 100 * ONE}(100 * ONE, 0);
+
+        uint256 yqsdBefore = yqsd.balanceOf(bob);
+        uint256 supplyBefore = yqsd.totalSupply();
+
+        vm.prank(bob);
+        qsd.redeem(qsdMinted / 2);
+
+        // yQSD burned 1:1 with QSD redeemed.
+        assertEq(yqsd.balanceOf(bob), yqsdBefore - qsdMinted / 2, "yqsd burned 1:1");
+        assertEq(yqsd.totalSupply(), supplyBefore - qsdMinted / 2, "supply burned");
+    }
+
+    function test_QsdIsTransferable_WithoutYieldClaim() public {
+        // Demonstrate the principal/yield separation: bob can transfer
+        // his QSD freely without giving up yield rights, because yQSD
+        // is a separate token that stays in his wallet.
+        vm.prank(bob);
+        (uint256 qsdMinted, ) = qsd.deposit{value: 100 * ONE}(100 * ONE, 0);
+
+        vm.prank(bob);
+        qsd.transfer(carol, qsdMinted);
+        assertEq(qsd.balanceOf(carol), qsdMinted, "carol has qsd");
+        assertEq(qsd.balanceOf(bob), 0, "bob has no qsd");
+        // Yield rights stayed with bob.
+        assertEq(yqsd.balanceOf(bob), qsdMinted, "bob keeps yqsd");
+        assertEq(yqsd.balanceOf(carol), 0, "carol has no yqsd");
+    }
+
+    function test_LeverageFee_DistributesToYieldClaimHolders() public {
+        // Alice was the bootstrap depositor (in setUp). She holds all
+        // outstanding yQSD. After bob opens a leveraged position, the
+        // entire iQRL fee accrues to alice's yQSD.
+        uint256 alicePendingBefore = yqsd.pending(alice);
+        assertEq(alicePendingBefore, 0, "alice starts with no pending");
+
+        vm.prank(bob);
+        (, , uint256 feeIqrl) = qsd.openPosition(uint128(10 * ONE), 1 days, type(uint256).max);
+
+        // Allow MasterChef rounding loss bounded by supply/SCALE wei.
+        uint256 tol = yqsd.totalSupply() / 1e18 + 100;
+        assertApproxEqAbs(yqsd.pending(alice), feeIqrl, tol, "alice gets the entire fee");
+
+        // Alice claims and receives the iQRL.
+        uint256 aliceIqrlBefore = iqrl.balanceOf(alice);
+        vm.prank(alice);
+        uint256 claimed = yqsd.claim();
+        assertApproxEqAbs(claimed, feeIqrl, tol, "alice claims feeIqrl");
+        assertApproxEqAbs(iqrl.balanceOf(alice) - aliceIqrlBefore, feeIqrl, tol, "iqrl transferred");
+    }
+
     function test_OpenPosition_BorrowerPaysPostBorrowRate() public {
         // A borrower taking utilization from 0 to 50% should pay the
         // 24% rate (rate at the post-borrow state), not the 12% rate
