@@ -38,58 +38,51 @@ contract InverseQRLTest is Test {
     // ------------------------------------------------------------------
 
     function test_Mint_AtPeg() public {
-        // p = $1: 1 iQRL costs 1 QRL + 0.005 QRL fee = 1.005 QRL.
+        // p = $1: 1 iQRL costs 1 QRL exactly (no mint fee).
         uint256 spent = _mintExact(alice, ONE);
 
         assertEq(iqrl.balanceOf(alice), ONE);
-        assertEq(spent, ONE + (ONE * 50 / 10_000));
+        assertEq(spent, ONE);
         assertEq(iqrl.qrlPermanentlyDestroyed(), spent);
     }
 
     function test_Mint_AtHighPrice_CostsLessQrl() public {
-        // p = $2: 1 iQRL = $0.50 = 0.25 QRL; fee = 0.25 * 0.005 = 0.00125.
+        // p = $2: 1 iQRL = $0.50 = 0.25 QRL.
         oracle.setPrice(2 * ONE);
         uint256 spent = _mintExact(alice, ONE);
-
-        uint256 expectedBase = ONE / 4; // 0.25 QRL
-        uint256 expectedFee = expectedBase * 50 / 10_000;
-        assertEq(spent, expectedBase + expectedFee);
+        assertEq(spent, ONE / 4);
     }
 
     function test_Mint_AtLowPrice_CostsMoreQrl() public {
-        // p = $0.50: 1 iQRL = $2 = 4 QRL; fee = 4 * 0.005 = 0.02 QRL.
+        // p = $0.50: 1 iQRL = $2 = 4 QRL.
         oracle.setPrice(ONE / 2);
         uint256 spent = _mintExact(alice, ONE);
-
-        uint256 expectedBase = 4 * ONE;
-        uint256 expectedFee = expectedBase * 50 / 10_000;
-        assertEq(spent, expectedBase + expectedFee);
+        assertEq(spent, 4 * ONE);
     }
 
     function test_Mint_RefundsSurplus() public {
-        // Send 2 QRL when the cost is only 1.005 QRL — the contract
-        // should refund the surplus.
+        // Send 2 QRL when the cost is only 1 QRL — the contract should
+        // refund the surplus.
         uint256 balBefore = alice.balance;
         vm.prank(alice);
         uint256 spent = iqrl.mint{value: 2 * ONE}(ONE);
 
-        uint256 expectedSpend = ONE + (ONE * 50 / 10_000);
-        assertEq(spent, expectedSpend);
-        assertEq(alice.balance, balBefore - expectedSpend);
-        assertEq(address(iqrl).balance, expectedSpend);
+        assertEq(spent, ONE);
+        assertEq(alice.balance, balBefore - ONE);
+        assertEq(address(iqrl).balance, ONE);
     }
 
     function test_Mint_SlippageProtection() public {
-        // At p=$1, 1 iQRL mint costs 1.005 QRL. Send only 1 QRL: revert.
+        // At p=$1, 1 iQRL mint costs exactly 1 QRL. Send only 0.5 QRL: revert.
         vm.prank(alice);
         vm.expectRevert(
             abi.encodeWithSelector(
                 InverseQRL.InsufficientPayment.selector,
-                ONE + (ONE * 50 / 10_000),
-                ONE
+                ONE,
+                ONE / 2
             )
         );
-        iqrl.mint{value: ONE}(ONE);
+        iqrl.mint{value: ONE / 2}(ONE);
     }
 
     function test_Mint_RevertsWhenBothPriceSourcesUnavailable() public {
@@ -165,8 +158,7 @@ contract InverseQRLTest is Test {
 
         uint256 spent = _mintExact(alice, ONE);
         assertEq(spent, quotedTotal);
-        assertGt(quotedFee, 0);
-        assertEq(quotedFee, quotedTotal * 50 / (10_000 + 50)); // fee/(1+feeBps)
+        assertEq(quotedFee, 0);
     }
 
     // ------------------------------------------------------------------
@@ -290,11 +282,11 @@ contract InverseQRLTest is Test {
         vm.warp(block.timestamp + iqrl.MIN_TWAP_WINDOW() + 1);
 
         // Oracle still at $1; TWAP averages toward $2.
-        // Cost at p=$1 is iqrlAmount/p^2 = iqrlAmount * 1.005 (+ fee).
-        // Cost at p=$2 is iqrlAmount/4 * 1.005.
+        // Cost at p=$1 is iqrlAmount/p^2 = iqrlAmount.
+        // Cost at p=$2 is iqrlAmount/4.
         // Oracle (lower price) → higher cost → that's what we charge.
         (uint256 cost,) = iqrl.quoteMint(ONE / 10);
-        // Cost should be near (ONE / 10) * 1.005, NOT (ONE / 40) * 1.005.
+        // Cost should be near (ONE / 10), NOT (ONE / 40).
         assertGt(cost, ONE / 12, "should reflect oracle p=$1, not pool p=$2");
     }
 
@@ -305,8 +297,8 @@ contract InverseQRLTest is Test {
         _mintExact(alice, ONE / 10);
         vm.warp(block.timestamp + iqrl.MIN_TWAP_WINDOW() + 1);
 
-        // At p=$0.5, cost = iqrlAmount / 0.25 = 4 * iqrlAmount, plus fee.
-        // At p=$1.0, cost = iqrlAmount, plus fee.
+        // At p=$0.5, cost = iqrlAmount / 0.25 = 4 * iqrlAmount.
+        // At p=$1.0, cost = iqrlAmount.
         // The TWAP path charges much more.
         (uint256 cost,) = iqrl.quoteMint(ONE / 10);
         assertGt(cost, 3 * ONE / 10, "should reflect pool p=$0.5, not oracle p=$1");
@@ -321,7 +313,7 @@ contract InverseQRLTest is Test {
 
         // TWAP unavailable → oracle alone (p=$1) → cost ≈ iqrlAmount.
         (uint256 cost,) = iqrl.quoteMint(ONE / 10);
-        // Cost should be near (ONE / 10) * 1.005, NOT 4x that.
+        // Cost should be near (ONE / 10), NOT 4x that.
         assertLt(cost, 2 * ONE / 10, "TWAP under MIN_TWAP_WINDOW should be ignored");
     }
 

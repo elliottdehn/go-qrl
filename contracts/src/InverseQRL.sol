@@ -36,15 +36,22 @@ interface IQsdPool {
 ///           would create for a 1/p-priced liability.
 ///         - Mint is rate-limited per-block to bound oracle-lag
 ///           arbitrage extraction.
-///         - 0.5% upfront mint fee (also burned) compensates QRL
-///           holders for the minter's oracle-lag option value.
+///         - Mint fee defaults to 0%. Oracle-lag arbitrage is
+///           bounded by min(oracle, pool TWAP) mint pricing and the
+///           per-block aggregate mint cap. Governance may re-enable
+///           the fee if oracle-lag extraction proves higher than
+///           expected in production.
 contract InverseQRL is ERC20, ERC20Burnable, ReentrancyGuard {
     /// @notice 1e18 fixed-point scale used throughout.
     uint256 internal constant SCALE = 1e18;
 
     /// @notice Mint fee in basis points of the pre-fee QRL cost.
-    ///         50 bps = 0.5%. Fee is destroyed along with the base cost.
-    uint256 public constant MINT_FEE_BPS = 50;
+    ///         Default 0 — oracle-lag arbitrage is bounded by the
+    ///         min(oracle, pool TWAP) mint-price floor and the per-
+    ///         block aggregate mint cap, both of which constrain
+    ///         extraction without imposing a per-mint friction on
+    ///         legitimate users.
+    uint256 public constant MINT_FEE_BPS = 0;
 
     /// @notice Per-block aggregate mint cap, in parts-per-million of
     ///         total iQRL supply. 25 ppm = 0.0025%. Limits arbitrage
