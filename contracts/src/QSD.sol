@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {ERC20Burnable} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -87,12 +88,79 @@ contract QSD is ERC20, ReentrancyGuard {
     ///         state-mutating operation.
     uint64 public lastPriceUpdate;
 
+    // ------------------------------------------------------------------
+    // Leverage facility
+    // ------------------------------------------------------------------
+
+    /// @notice Maximum loan duration. Loans must be settled (voluntarily
+    ///         by the owner or via forceClose by anyone after expiry)
+    ///         within this window.
+    uint256 public constant LEVERAGE_MAX_DURATION = 1 days;
+
+    /// @notice Interest rate floor in basis points / year (12% APR).
+    ///         Charged at zero pool utilization.
+    uint256 public constant LEVERAGE_MIN_RATE_BPS = 1200;
+
+    /// @notice Interest rate ceiling in basis points / year (24% APR).
+    ///         Charged when 50% of the pool (the cap) is loaned out.
+    uint256 public constant LEVERAGE_MAX_RATE_BPS = 2400;
+
+    /// @notice Maximum fraction of the pool's total token holdings that
+    ///         may be loaned out at any time, expressed in basis points.
+    ///         5000 bps = 50%. New loans that would exceed this cap revert.
+    uint256 public constant LEVERAGE_POOL_CAP_BPS = 5000;
+
+    uint256 internal constant LEVERAGE_BPS = 10_000;
+    uint256 internal constant LEVERAGE_SECONDS_PER_YEAR = 365 days;
+
+    /// @notice State of an open leveraged long-vol position.
+    /// @dev    Sandbox tokens are held by the QSD contract on the
+    ///         borrower's behalf. They never leave the contract until
+    ///         settlement and may only be moved by sandbox swaps that
+    ///         monotonically converge toward the pool's current ratio.
+    struct Position {
+        address owner;          // borrower
+        uint128 qrlOwed;        // initial QRL borrowed (== sandbox at open)
+        uint128 iqrlOwed;       // initial iQRL borrowed
+        uint128 qrlBalance;     // sandbox QRL (mutates via sandbox swap)
+        uint128 iqrlBalance;    // sandbox iQRL
+        uint64  deadline;       // open + LEVERAGE_MAX_DURATION
+    }
+
+    /// @notice positionId => Position. Closed positions are deleted.
+    mapping(uint256 => Position) public positions;
+
+    /// @notice Next position id. Monotone increasing; never zero.
+    uint256 public nextPositionId = 1;
+
+    /// @notice Sum of qrlBalance across all open positions. Used for
+    ///         (a) the 50% pool cap and (b) the aggregate-solvency
+    ///         invariant: 2*sqrt((poolQRL + lentQRL)*(poolIQRL +
+    ///         lentIQRL)) >= totalSupply().
+    uint256 public lentQRL;
+
+    /// @notice Sum of iqrlBalance across all open positions.
+    uint256 public lentIQRL;
+
     error EmptyPool();
     error OracleUnhealthy();
     error ZeroAmount();
     error UnexpectedValue(uint256 expected, uint256 received);
     error SlippageExceeded(uint256 amountOut, uint256 minAmountOut);
     error NativeTransferFailed();
+    error PositionNotOwned();
+    error PositionNotFound();
+    error PositionExpired();
+    error PositionStillActive();
+    error LeverageCapExceeded(uint256 requested, uint256 available);
+    error DurationOutOfRange();
+    error InsufficientFee(uint256 required, uint256 supplied);
+    error ConvergenceViolation();
+    error InsufficientSandboxBalance();
+    error SolvencyWouldBreak();
+    error PoolNotAtParity();
+    error PoolNotInDiscount();
+    error PoolNotInPremium();
 
     event Deposited(
         address indexed user,
@@ -113,6 +181,33 @@ contract QSD is ERC20, ReentrancyGuard {
         bool qrlIn,
         uint256 amountIn,
         uint256 amountOut
+    );
+
+    event PositionOpened(
+        uint256 indexed positionId,
+        address indexed owner,
+        uint256 qrlOwed,
+        uint256 iqrlOwed,
+        uint256 feeIqrlBurned,
+        uint256 rateBps,
+        uint64 deadline
+    );
+
+    event SandboxSwapped(
+        uint256 indexed positionId,
+        bool qrlIn,
+        uint256 amountIn,
+        uint256 amountOut
+    );
+
+    event PositionClosed(
+        uint256 indexed positionId,
+        address indexed owner,
+        uint256 qrlReturnedToPool,
+        uint256 iqrlReturnedToPool,
+        uint256 qrlPaidToOwner,
+        uint256 iqrlPaidToOwner,
+        bool forced
     );
 
     constructor(IERC20 _iqrl, IPriceOracle _oracle) ERC20("Quantum Stable Dollar", "QSD") {
@@ -457,17 +552,24 @@ contract QSD is ERC20, ReentrancyGuard {
     // The invariant is asserted after every state-changing entrypoint
     // and exposed via checkInvariants() for tests and external monitors.
 
-    /// @notice External view: returns true iff the core solvency
-    ///         invariant holds at the current state.
+    /// @notice External view: returns true iff the core aggregate
+    ///         solvency invariant holds at the current state. Aggregate
+    ///         covers pool reserves + tokens currently lent to leverage
+    ///         positions, since all sandbox swaps preserve aggregate k
+    ///         exactly. The pool-only k may be lower than supply during
+    ///         active loans, which is intentional.
     function checkInvariants() external view returns (bool) {
-        return 2 * Math.sqrt(poolQRL * poolIQRL) >= totalSupply();
+        return 2 * Math.sqrt((poolQRL + lentQRL) * (poolIQRL + lentIQRL)) >= totalSupply();
     }
 
-    /// @dev    Internal solvency check; uses Solidity's `assert` so a
-    ///         failure produces a Panic and signals a critical bug
-    ///         rather than a recoverable user error.
+    /// @dev    Internal solvency check on contract aggregate holdings
+    ///         (pool + lent). Uses `assert` so a failure produces a
+    ///         Panic and signals a critical bug. Sandbox swaps and
+    ///         loan opens preserve aggregate exactly; only deposits,
+    ///         redemptions, external swaps, and position closes can
+    ///         change the aggregate, and all of those check this.
     function _assertSolvent() internal view {
-        assert(2 * Math.sqrt(poolQRL * poolIQRL) >= totalSupply());
+        assert(2 * Math.sqrt((poolQRL + lentQRL) * (poolIQRL + lentIQRL)) >= totalSupply());
     }
 
     /// @dev    Send `amount` native QRL to `to`. Reverts on failure;
@@ -522,5 +624,536 @@ contract QSD is ERC20, ReentrancyGuard {
             uint256 spot = Math.sqrt((poolIQRL * SCALE * SCALE) / poolQRL);
             cumulative += spot * elapsed;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Leverage facility
+    // ------------------------------------------------------------------
+    //
+    // No-collateral leveraged long-vol positions backed by the pool's
+    // own depth. A borrower:
+    //
+    //   1. Pays an iQRL fee upfront (linear utilization curve from 12%
+    //      to 24% APR, scaled to chosen duration). The fee is burned
+    //      immediately and is non-refundable on early settlement.
+    //   2. Receives a sandbox account holding (qrlOwed, iqrlOwed) at
+    //      the pool's current marginal ratio. Pool reserves drop by the
+    //      same amounts; aggregate (pool + lent) is preserved.
+    //   3. May swap their sandbox through the pool, but only in the
+    //      direction that monotonically reduces the gap between
+    //      sandbox.R and pool.R. Each rebalance captures realized
+    //      variance (gamma scalping); k_sandbox grows weakly.
+    //   4. Settles voluntarily anytime before deadline, or anyone may
+    //      force-close after the deadline. Pool reclaims tokens with
+    //      product k_loan at sandbox's current ratio; borrower keeps
+    //      excess as gamma profit, modulo aggregate solvency.
+    //
+    // Aggregate solvency floor (poolQRL + lentQRL)*(poolIQRL +
+    // lentIQRL) >= (totalSupply()/2)^2 is preserved by opens and
+    // sandbox swaps exactly, and asserted post-close. External pool
+    // activity (swaps, deposits) accumulates slack via slippage that
+    // bounded gamma extraction at close.
+
+    /// @notice Current interest rate in basis points / year at the
+    ///         present utilization. Public callers see the rate that
+    ///         would apply to a zero-size additional borrow. New
+    ///         loans actually pay the rate at *post-borrow*
+    ///         utilization (see openPosition), so a borrower who
+    ///         takes utilization from 0% to 50% pays the 24% rate,
+    ///         not 12%.
+    function leverageRateBps() public view returns (uint256) {
+        return _rateAt(lentQRL);
+    }
+
+    /// @dev Pool-must-be-at-parity guard for openPosition.
+    ///      Allows the smallest tolerance compatible with integer
+    ///      rounding on a parity-restoring swap (1 part per 1e9
+    ///      relative deviation in the cross-product check).
+    function _requireParity() internal view {
+        if (poolQRL == 0 || poolIQRL == 0) revert EmptyPool();
+        uint256 p = oracle.price();
+        if (p == 0 || !oracle.healthy()) revert OracleUnhealthy();
+        // poolIQRL/poolQRL == p^2/SCALE^2  ⟺  poolIQRL * SCALE^2 == poolQRL * p^2
+        uint256 lhs = poolIQRL * SCALE * SCALE;
+        uint256 rhs = poolQRL * p * p;
+        uint256 diff = lhs > rhs ? lhs - rhs : rhs - lhs;
+        // Tolerance: diff must be < max(lhs, rhs) / 1e9.
+        uint256 ref = lhs > rhs ? lhs : rhs;
+        if (diff * 1_000_000_000 > ref) revert PoolNotAtParity();
+    }
+
+    /// @dev Compute the rate at a specific lent-amount, using the
+    ///      contract's current total token holdings as the
+    ///      denominator. Linear interpolation between
+    ///      LEVERAGE_MIN_RATE_BPS at u=0 and LEVERAGE_MAX_RATE_BPS at
+    ///      u=0.5 (the cap).
+    function _rateAt(uint256 lentTotal) internal view returns (uint256) {
+        uint256 totalQ = poolQRL + lentQRL;
+        if (totalQ == 0) return LEVERAGE_MIN_RATE_BPS;
+        uint256 utilScaled = (lentTotal * SCALE) / totalQ;
+        uint256 spread = LEVERAGE_MAX_RATE_BPS - LEVERAGE_MIN_RATE_BPS;
+        uint256 rate = LEVERAGE_MIN_RATE_BPS + (spread * 2 * utilScaled) / SCALE;
+        if (rate > LEVERAGE_MAX_RATE_BPS) rate = LEVERAGE_MAX_RATE_BPS;
+        return rate;
+    }
+
+    /// @notice Quote the iQRL fee for a hypothetical loan, using the
+    ///         post-borrow rate (the rate the borrower would pay).
+    function quoteLeverageFee(uint128 qrlAmount, uint64 durationSeconds)
+        external
+        view
+        returns (uint256 feeIqrl, uint256 iqrlAmount, uint256 rateBps)
+    {
+        if (poolQRL == 0 || poolIQRL == 0) revert EmptyPool();
+        iqrlAmount = (uint256(qrlAmount) * poolIQRL) / poolQRL;
+        rateBps = _rateAt(lentQRL + uint256(qrlAmount));
+        uint256 p = oracle.price();
+        if (p == 0) revert OracleUnhealthy();
+        feeIqrl = _computeFeeIqrl(uint256(qrlAmount), iqrlAmount, p, rateBps, durationSeconds);
+    }
+
+    /// @notice Open a leveraged long-vol position. Pool must be at
+    ///         canonical parity for the current oracle price; otherwise
+    ///         reverts with PoolNotAtParity. Use the bundled
+    ///         `openPositionAtParityFromDiscount` /
+    ///         `openPositionAtParityFromPremium` helpers to atomically
+    ///         restore parity and open in one call.
+    /// @param  qrlAmount        QRL leg of the symmetric loan.
+    /// @param  durationSeconds  Position lifetime; (0, LEVERAGE_MAX_DURATION].
+    /// @param  maxFeeIqrl       Slippage cap on the iQRL fee. Caller
+    ///                          must have approved this contract for
+    ///                          at least the actual fee amount.
+    /// @return positionId       Identifier for the new position.
+    /// @return iqrlAmount       Amount of iQRL pulled from pool into
+    ///                          the borrower's sandbox.
+    /// @return feeIqrl          Actual iQRL fee burned (≤ maxFeeIqrl).
+    function openPosition(uint128 qrlAmount, uint64 durationSeconds, uint256 maxFeeIqrl)
+        external
+        nonReentrant
+        returns (uint256 positionId, uint256 iqrlAmount, uint256 feeIqrl)
+    {
+        _requireParity();
+        return _openPositionUnchecked(qrlAmount, durationSeconds, maxFeeIqrl);
+    }
+
+    /// @notice Atomically restore pool parity (in either direction)
+    ///         and open a leveraged position. Pool state at landing
+    ///         time may be discount, premium, or parity; the function
+    ///         handles all three. Caller pre-funds both directions:
+    ///         msg.value supplies QRL for closing a discount; the
+    ///         contract pulls up to maxIqrlInForParity iQRL via
+    ///         allowance for closing a premium. The unused side is
+    ///         refunded at the end. The captured parity-swap output
+    ///         (iQRL or QRL, depending on direction) goes to the
+    ///         caller as their peg-restoration profit.
+    function openPositionAtParity(
+        uint128 qrlAmount,
+        uint64 durationSeconds,
+        uint256 maxFeeIqrl,
+        uint256 maxIqrlInForParity,
+        uint256 minOutForParity
+    )
+        external
+        payable
+        nonReentrant
+        returns (
+            uint256 positionId,
+            uint256 iqrlAmount,
+            uint256 feeIqrl,
+            uint256 paritySwapIn,
+            uint256 paritySwapOut,
+            bool discountClosed
+        )
+    {
+        if (poolQRL == 0 || poolIQRL == 0) revert EmptyPool();
+        _updatePriceCumulative();
+
+        uint256 p = oracle.price();
+        if (p == 0 || !oracle.healthy()) revert OracleUnhealthy();
+
+        // Compare current ratio to canonical via cross-product to avoid
+        // intermediate division. lhs > rhs ⟺ B/A > p^2 ⟺ discount.
+        uint256 lhs = poolIQRL * SCALE * SCALE;
+        uint256 rhs = poolQRL * p * p;
+
+        if (lhs > rhs) {
+            // Discount: swap QRL→iQRL to bring pool to parity.
+            // target_A = sqrt(k) * SCALE / p; spend = target_A - poolQRL.
+            uint256 targetA = (Math.sqrt(poolQRL * poolIQRL) * SCALE) / p;
+            paritySwapIn = targetA - poolQRL;
+            if (msg.value < paritySwapIn) revert UnexpectedValue(paritySwapIn, msg.value);
+
+            paritySwapOut = (poolIQRL * paritySwapIn) / (poolQRL + paritySwapIn);
+            if (paritySwapOut < minOutForParity) revert SlippageExceeded(paritySwapOut, minOutForParity);
+
+            poolQRL += paritySwapIn;
+            poolIQRL -= paritySwapOut;
+            emit Swapped(msg.sender, true, paritySwapIn, paritySwapOut);
+
+            iqrl.safeTransfer(msg.sender, paritySwapOut);
+            discountClosed = true;
+        } else if (lhs < rhs) {
+            // Premium: swap iQRL→QRL to bring pool to parity.
+            uint256 targetB = (Math.sqrt(poolQRL * poolIQRL) * p) / SCALE;
+            paritySwapIn = targetB - poolIQRL;
+            if (paritySwapIn > maxIqrlInForParity) revert SlippageExceeded(paritySwapIn, maxIqrlInForParity);
+
+            paritySwapOut = (poolQRL * paritySwapIn) / (poolIQRL + paritySwapIn);
+            if (paritySwapOut < minOutForParity) revert SlippageExceeded(paritySwapOut, minOutForParity);
+
+            iqrl.safeTransferFrom(msg.sender, address(this), paritySwapIn);
+
+            poolIQRL += paritySwapIn;
+            poolQRL -= paritySwapOut;
+            emit Swapped(msg.sender, false, paritySwapIn, paritySwapOut);
+
+            _payNative(msg.sender, paritySwapOut);
+            discountClosed = false;
+        }
+        // else: pool already at parity (within rounding); no parity swap.
+
+        // Pool is now at parity. Open the position.
+        (positionId, iqrlAmount, feeIqrl) = _openPositionUnchecked(qrlAmount, durationSeconds, maxFeeIqrl);
+
+        // Refund any unused QRL (always safe — covers both branches).
+        uint256 qrlSpent = lhs > rhs ? paritySwapIn : 0;
+        if (msg.value > qrlSpent) {
+            _payNative(msg.sender, msg.value - qrlSpent);
+        }
+    }
+
+    /// @dev Internal core of open-position. Caller is responsible for
+    ///      ensuring the pool is at parity before invocation; this
+    ///      function does no parity check.
+    function _openPositionUnchecked(uint128 qrlAmount, uint64 durationSeconds, uint256 maxFeeIqrl)
+        internal
+        returns (uint256 positionId, uint256 iqrlAmount, uint256 feeIqrl)
+    {
+        if (qrlAmount == 0) revert ZeroAmount();
+        if (durationSeconds == 0 || durationSeconds > LEVERAGE_MAX_DURATION) revert DurationOutOfRange();
+        if (poolQRL == 0 || poolIQRL == 0) revert EmptyPool();
+
+        _updatePriceCumulative();
+
+        // 50%-of-pool cap on aggregate lent. The cap on QRL implies
+        // the same cap on iQRL because all loans are symmetric at the
+        // pool's marginal ratio at the moment of opening.
+        uint256 totalQ = poolQRL + lentQRL;
+        uint256 capQ = (totalQ * LEVERAGE_POOL_CAP_BPS) / LEVERAGE_BPS;
+        if (lentQRL + qrlAmount > capQ) {
+            revert LeverageCapExceeded(lentQRL + qrlAmount, capQ);
+        }
+
+        iqrlAmount = (uint256(qrlAmount) * poolIQRL) / poolQRL;
+        if (iqrlAmount == 0 || iqrlAmount > type(uint128).max) revert ZeroAmount();
+
+        // Borrower pays the rate at POST-borrow utilization. A
+        // borrower who consumes the last bit of available depth pays
+        // the cap rate; an earlier borrower against zero utilization
+        // pays a lower rate. This mirrors the Compound/Aave pattern
+        // where rate is a function of post-state utilization.
+        uint256 rateBps = _rateAt(lentQRL + uint256(qrlAmount));
+        uint256 p = oracle.price();
+        if (p == 0 || !oracle.healthy()) revert OracleUnhealthy();
+
+        feeIqrl = _computeFeeIqrl(uint256(qrlAmount), iqrlAmount, p, rateBps, durationSeconds);
+        if (feeIqrl > maxFeeIqrl) revert InsufficientFee(feeIqrl, maxFeeIqrl);
+
+        // Burn the fee out of the borrower's iQRL balance via allowance.
+        // burnFrom consumes allowance and burns the tokens; the fee
+        // never enters this contract's accounting.
+        ERC20Burnable(address(iqrl)).burnFrom(msg.sender, feeIqrl);
+
+        // Move tokens from pool to sandbox. Aggregate (pool + lent) is
+        // preserved exactly; pool's k drops, lent's k rises, but the
+        // aggregate solvency invariant uses pool+lent which is
+        // unchanged.
+        poolQRL -= qrlAmount;
+        poolIQRL -= iqrlAmount;
+        lentQRL += qrlAmount;
+        lentIQRL += iqrlAmount;
+
+        positionId = nextPositionId++;
+        positions[positionId] = Position({
+            owner: msg.sender,
+            qrlOwed: qrlAmount,
+            iqrlOwed: uint128(iqrlAmount),
+            qrlBalance: qrlAmount,
+            iqrlBalance: uint128(iqrlAmount),
+            deadline: uint64(block.timestamp) + durationSeconds
+        });
+
+        _assertSolvent();
+
+        emit PositionOpened(
+            positionId, msg.sender,
+            qrlAmount, iqrlAmount,
+            feeIqrl, rateBps,
+            uint64(block.timestamp) + durationSeconds
+        );
+    }
+
+    /// @notice Sandbox-swap QRL→iQRL for `positionId`. Only callable by
+    ///         the position owner. The swap routes through the pool
+    ///         and must monotonically reduce the gap between sandbox
+    ///         and pool ratios (else reverts).
+    function sandboxSwapQrlForIqrl(uint256 positionId, uint128 qrlIn, uint256 minIqrlOut)
+        external
+        nonReentrant
+        returns (uint256 iqrlOut)
+    {
+        Position storage pos = positions[positionId];
+        if (pos.owner != msg.sender) revert PositionNotOwned();
+        if (block.timestamp >= pos.deadline) revert PositionExpired();
+        if (qrlIn == 0) revert ZeroAmount();
+        if (qrlIn > pos.qrlBalance) revert InsufficientSandboxBalance();
+        if (poolQRL == 0 || poolIQRL == 0) revert EmptyPool();
+
+        _updatePriceCumulative();
+
+        // Snapshot before-state for convergence check.
+        uint256 sQ_before = pos.qrlBalance;
+        uint256 sI_before = pos.iqrlBalance;
+        uint256 pQ_before = poolQRL;
+        uint256 pI_before = poolIQRL;
+
+        // Standard CPMM quote at current pool reserves.
+        iqrlOut = (poolIQRL * uint256(qrlIn)) / (poolQRL + uint256(qrlIn));
+        if (iqrlOut < minIqrlOut) revert SlippageExceeded(iqrlOut, minIqrlOut);
+
+        // Apply the swap to both sandbox and pool. Aggregate preserved.
+        pos.qrlBalance = uint128(uint256(pos.qrlBalance) - uint256(qrlIn));
+        pos.iqrlBalance = uint128(uint256(pos.iqrlBalance) + iqrlOut);
+        poolQRL += qrlIn;
+        poolIQRL -= iqrlOut;
+        lentQRL -= qrlIn;
+        lentIQRL += iqrlOut;
+
+        _assertConverges(
+            sQ_before, sI_before, pos.qrlBalance, pos.iqrlBalance,
+            pQ_before, pI_before, poolQRL, poolIQRL
+        );
+
+        _assertSolvent();
+
+        emit SandboxSwapped(positionId, true, qrlIn, iqrlOut);
+    }
+
+    /// @notice Sandbox-swap iQRL→QRL for `positionId`. Mirror of the
+    ///         QRL→iQRL path; same convergence requirement.
+    function sandboxSwapIqrlForQrl(uint256 positionId, uint128 iqrlIn, uint256 minQrlOut)
+        external
+        nonReentrant
+        returns (uint256 qrlOut)
+    {
+        Position storage pos = positions[positionId];
+        if (pos.owner != msg.sender) revert PositionNotOwned();
+        if (block.timestamp >= pos.deadline) revert PositionExpired();
+        if (iqrlIn == 0) revert ZeroAmount();
+        if (iqrlIn > pos.iqrlBalance) revert InsufficientSandboxBalance();
+        if (poolQRL == 0 || poolIQRL == 0) revert EmptyPool();
+
+        _updatePriceCumulative();
+
+        uint256 sQ_before = pos.qrlBalance;
+        uint256 sI_before = pos.iqrlBalance;
+        uint256 pQ_before = poolQRL;
+        uint256 pI_before = poolIQRL;
+
+        qrlOut = (poolQRL * uint256(iqrlIn)) / (poolIQRL + uint256(iqrlIn));
+        if (qrlOut < minQrlOut) revert SlippageExceeded(qrlOut, minQrlOut);
+
+        pos.iqrlBalance = uint128(uint256(pos.iqrlBalance) - uint256(iqrlIn));
+        pos.qrlBalance = uint128(uint256(pos.qrlBalance) + qrlOut);
+        poolIQRL += iqrlIn;
+        poolQRL -= qrlOut;
+        lentIQRL -= iqrlIn;
+        lentQRL += qrlOut;
+
+        _assertConverges(
+            sQ_before, sI_before, pos.qrlBalance, pos.iqrlBalance,
+            pQ_before, pI_before, poolQRL, poolIQRL
+        );
+
+        _assertSolvent();
+
+        emit SandboxSwapped(positionId, false, iqrlIn, qrlOut);
+    }
+
+    /// @notice Voluntarily close a position before its deadline.
+    ///         Reverts if the resulting payout would break aggregate
+    ///         solvency; in that case the borrower may wait for pool
+    ///         depth to grow (deposits, external arb slippage) and
+    ///         retry, or accept force-close after the deadline.
+    function closePosition(uint256 positionId)
+        external
+        nonReentrant
+        returns (uint256 qrlPaid, uint256 iqrlPaid)
+    {
+        Position storage pos = positions[positionId];
+        if (pos.owner != msg.sender) revert PositionNotOwned();
+        return _settle(positionId, pos, /*forced=*/false);
+    }
+
+    /// @notice Force-close an expired position. Anyone may call this
+    ///         after the deadline. Returns full sandbox to the pool;
+    ///         pays the borrower the excess only if aggregate
+    ///         solvency permits, otherwise borrower receives zero
+    ///         excess and pool retains the full sandbox.
+    function forceClosePosition(uint256 positionId)
+        external
+        nonReentrant
+        returns (uint256 qrlPaid, uint256 iqrlPaid)
+    {
+        Position storage pos = positions[positionId];
+        if (pos.owner == address(0)) revert PositionNotFound();
+        if (block.timestamp < pos.deadline) revert PositionStillActive();
+        return _settle(positionId, pos, /*forced=*/true);
+    }
+
+    /// @dev Compute the iQRL fee for a hypothetical loan. Fee is the
+    ///      annualized USD-canonical loan value times the rate over
+    ///      duration, converted to iQRL units (1 USD = p iQRL canonical).
+    function _computeFeeIqrl(
+        uint256 qrlAmount,
+        uint256 iqrlAmount,
+        uint256 p,
+        uint256 rateBps,
+        uint64 durationSeconds
+    ) internal pure returns (uint256) {
+        // loanUsd = qrl*p + iqrl/p (1e18 scale)
+        uint256 loanUsd = (qrlAmount * p) / SCALE + (iqrlAmount * SCALE) / p;
+        // feeUsd = loanUsd * rate * dur / (BPS * year)
+        uint256 feeUsd = (loanUsd * rateBps * uint256(durationSeconds)) / (LEVERAGE_BPS * LEVERAGE_SECONDS_PER_YEAR);
+        // feeIqrl = feeUsd * p (since 1 USD = p iQRL canonical)
+        return (feeUsd * p) / SCALE;
+    }
+
+    /// @dev Convergence check: each sandbox swap must monotonically
+    ///      reduce |sandbox.R - pool.R|, where R = iqrl/qrl. Compares
+    ///      ratios in 1e18 fixed-point (one division each side; precision
+    ///      loss is acceptable for the gating decision).
+    function _assertConverges(
+        uint256 sQb, uint256 sIb,
+        uint256 sQa, uint256 sIa,
+        uint256 pQb, uint256 pIb,
+        uint256 pQa, uint256 pIa
+    ) internal pure {
+        if (sQb == 0 || sQa == 0 || pQb == 0 || pQa == 0) revert ConvergenceViolation();
+        uint256 Rs_before = (sIb * SCALE) / sQb;
+        uint256 Rp_before = (pIb * SCALE) / pQb;
+        uint256 Rs_after = (sIa * SCALE) / sQa;
+        uint256 Rp_after = (pIa * SCALE) / pQa;
+        uint256 gapBefore = Rs_before > Rp_before ? Rs_before - Rp_before : Rp_before - Rs_before;
+        uint256 gapAfter  = Rs_after  > Rp_after  ? Rs_after  - Rp_after  : Rp_after  - Rs_after;
+        if (gapAfter > gapBefore) revert ConvergenceViolation();
+    }
+
+    /// @dev Settlement implementation shared by close and forceClose.
+    ///      Pool reclaims (takeQ, takeI) with product = k_loan at the
+    ///      sandbox's current ratio. Borrower keeps the excess subject
+    ///      to aggregate solvency.
+    function _settle(uint256 positionId, Position storage pos, bool forced)
+        internal
+        returns (uint256 qrlPaid, uint256 iqrlPaid)
+    {
+        _updatePriceCumulative();
+
+        address owner = pos.owner;
+        (uint256 takeQ, uint256 takeI) = _computeTake(pos);
+        uint256 sQ = pos.qrlBalance;
+        uint256 sI = pos.iqrlBalance;
+
+        // Apply settlement to pool/lent state.
+        poolQRL += takeQ;
+        poolIQRL += takeI;
+        lentQRL -= sQ;
+        lentIQRL -= sI;
+
+        // If standard take breaks aggregate solvency: voluntary close
+        // reverts, forced close eats borrower's excess into the pool.
+        if (2 * Math.sqrt((poolQRL + lentQRL) * (poolIQRL + lentIQRL)) < totalSupply()) {
+            if (!forced) revert SolvencyWouldBreak();
+            poolQRL += (sQ - takeQ);
+            poolIQRL += (sI - takeI);
+            takeQ = sQ;
+            takeI = sI;
+        }
+
+        qrlPaid = sQ - takeQ;
+        iqrlPaid = sI - takeI;
+
+        delete positions[positionId];
+
+        if (iqrlPaid > 0) iqrl.safeTransfer(owner, iqrlPaid);
+        if (qrlPaid > 0) _payNative(owner, qrlPaid);
+
+        _assertSolvent();
+
+        emit PositionClosed(positionId, owner, takeQ, takeI, qrlPaid, iqrlPaid, forced);
+    }
+
+    /// @dev Compute the pool's take from a sandbox at settlement.
+    ///      Slice has canonical USD value == loan_USD_at_current_p, taken
+    ///      at the sandbox's current ratio. Borrower keeps the residual,
+    ///      which is the captured gamma in USD terms.
+    ///
+    ///      The factor `loan_USD / sandbox_USD` extracts exactly the
+    ///      original loan principal in canonical USD; the borrower's
+    ///      payout is the convexity premium their position accumulated
+    ///      via convergence trades against off-canonical pool states.
+    ///
+    ///      Falls back to k-based slicing if the oracle is unhealthy
+    ///      (canonical USD valuation requires a live price).
+    function _computeTake(Position storage pos)
+        internal
+        view
+        returns (uint256 takeQ, uint256 takeI)
+    {
+        uint256 sQ = pos.qrlBalance;
+        uint256 sI = pos.iqrlBalance;
+        if (sQ == 0 && sI == 0) return (0, 0);
+
+        uint256 p = oracle.healthy() ? oracle.price() : 0;
+        if (p > 0 && sQ > 0 && sI > 0) {
+            // USD-based take: factor = loan_USD / sandbox_USD.
+            uint256 loanUSD =
+                (uint256(pos.qrlOwed) * p) / SCALE +
+                (uint256(pos.iqrlOwed) * SCALE) / p;
+            uint256 sandboxUSD = (sQ * p) / SCALE + (sI * SCALE) / p;
+            if (sandboxUSD <= loanUSD) {
+                // Sandbox failed to bank gamma (rare in zero-fee CPMM,
+                // possible if oracle p moved unfavorably vs loan ratio).
+                // Pool takes everything; borrower forfeits.
+                takeQ = sQ;
+                takeI = sI;
+            } else {
+                uint256 sliceFactor = (loanUSD * SCALE) / sandboxUSD;
+                takeQ = (sQ * sliceFactor) / SCALE;
+                takeI = (sI * sliceFactor) / SCALE;
+                // Round up by one wei on each leg to ensure pool's claim
+                // is satisfied exactly under integer arithmetic.
+                if (takeQ < sQ) takeQ += 1;
+                if (takeI < sI) takeI += 1;
+            }
+        } else {
+            // Oracle unhealthy: fall back to k-based slice. This
+            // under-rewards gamma but preserves solvency without
+            // requiring oracle access at settle.
+            uint256 kLoan = uint256(pos.qrlOwed) * uint256(pos.iqrlOwed);
+            uint256 kSandbox = sQ * sI;
+            if (kSandbox >= kLoan && sQ > 0 && sI > 0) {
+                uint256 sliceFactor = Math.sqrt((kLoan * SCALE * SCALE) / kSandbox);
+                takeQ = (sQ * sliceFactor) / SCALE;
+                takeI = (sI * sliceFactor) / SCALE;
+                if (takeQ < sQ) takeQ += 1;
+                if (takeI < sI) takeI += 1;
+            } else {
+                takeQ = sQ;
+                takeI = sI;
+            }
+        }
+        if (takeQ > sQ) takeQ = sQ;
+        if (takeI > sI) takeI = sI;
     }
 }
