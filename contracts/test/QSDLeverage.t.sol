@@ -4,15 +4,18 @@ pragma solidity ^0.8.24;
 import {Test, console2} from "forge-std/Test.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
-import {QSD} from "../src/QSD.sol";
+import {QSD, IYieldQSD} from "../src/QSD.sol";
+import {YieldQSD} from "../src/YieldQSD.sol";
 import {IPriceOracle} from "../src/interfaces/IPriceOracle.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockPriceOracle} from "./mocks/MockPriceOracle.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @notice Tests for the QSD leverage facility (open / sandbox swap /
 ///         close / forceClose paths).
 contract QSDLeverageTest is Test {
     QSD internal qsd;
+    YieldQSD internal yqsd;
     MockERC20 internal iqrl;
     MockPriceOracle internal oracle;
 
@@ -25,7 +28,13 @@ contract QSDLeverageTest is Test {
     function setUp() public {
         iqrl = new MockERC20("iQRL", "iQRL");
         oracle = new MockPriceOracle(ONE); // p = $1.00
-        qsd = new QSD(iqrl, oracle);
+
+        address predictedYqsd = vm.computeCreateAddress(
+            address(this), vm.getNonce(address(this)) + 1
+        );
+        qsd = new QSD(iqrl, oracle, IYieldQSD(predictedYqsd));
+        yqsd = new YieldQSD(IERC20(address(qsd)), iqrl);
+        require(address(yqsd) == predictedYqsd, "yqsd address prediction failed");
 
         _fund(alice);
         _fund(bob);
@@ -70,20 +79,22 @@ contract QSDLeverageTest is Test {
         assertTrue(qsd.checkInvariants());
     }
 
-    function test_OpenPosition_BurnsFeeFromBorrower() public {
+    function test_OpenPosition_RoutesFeeToYieldQSD() public {
         uint256 supplyBefore = iqrl.totalSupply();
         uint256 bobIqrlBefore = iqrl.balanceOf(bob);
+        uint256 yqsdIqrlBefore = iqrl.balanceOf(address(yqsd));
 
         vm.prank(bob);
         (, , uint256 feeIqrl) = qsd.openPosition(uint128(10 * ONE), 1 days, type(uint256).max);
 
-        // Total supply dropped by the fee (burned).
-        assertEq(iqrl.totalSupply(), supplyBefore - feeIqrl, "fee burned from supply");
+        // Total supply unchanged: fee is no longer burned.
+        assertEq(iqrl.totalSupply(), supplyBefore, "supply unchanged (fee routed, not burned)");
         // Borrower's balance dropped by the fee.
         assertEq(iqrl.balanceOf(bob), bobIqrlBefore - feeIqrl, "fee debited from borrower");
-        // Fee did not enter QSD's iqrl balance.
-        // (The pool's iqrl already dropped by 10 * ONE for the loan; no
-        // additional movement from the fee path.)
+        // yQSD received the fee verbatim.
+        assertEq(iqrl.balanceOf(address(yqsd)) - yqsdIqrlBefore, feeIqrl, "fee landed at yQSD");
+        // yQSD recorded the distribution.
+        assertEq(yqsd.totalDistributed(), feeIqrl, "yQSD recorded the distribution");
     }
 
     function test_OpenPosition_RateAtZeroUtilization_Is12Pct() public view {

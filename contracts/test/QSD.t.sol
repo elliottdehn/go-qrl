@@ -4,14 +4,17 @@ pragma solidity ^0.8.24;
 import {Test, console2} from "forge-std/Test.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
-import {QSD} from "../src/QSD.sol";
+import {QSD, IYieldQSD} from "../src/QSD.sol";
+import {YieldQSD} from "../src/YieldQSD.sol";
 import {IPriceOracle} from "../src/interfaces/IPriceOracle.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockPriceOracle} from "./mocks/MockPriceOracle.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @notice Unit + fuzz tests for the QSD contract.
 contract QSDTest is Test {
     QSD internal qsd;
+    YieldQSD internal yqsd;
     MockERC20 internal iqrl;
     MockPriceOracle internal oracle;
 
@@ -23,7 +26,16 @@ contract QSDTest is Test {
     function setUp() public {
         iqrl = new MockERC20("iQRL", "iQRL");
         oracle = new MockPriceOracle(ONE); // p = $1.00
-        qsd = new QSD(iqrl, oracle);
+
+        // Break the QSD <-> YieldQSD constructor cycle: predict yQSD's
+        // future deployment address (next nonce), pass it to QSD, then
+        // deploy yQSD which lands at the predicted address.
+        address predictedYqsd = vm.computeCreateAddress(
+            address(this), vm.getNonce(address(this)) + 1
+        );
+        qsd = new QSD(iqrl, oracle, IYieldQSD(predictedYqsd));
+        yqsd = new YieldQSD(IERC20(address(qsd)), iqrl);
+        require(address(yqsd) == predictedYqsd, "yqsd address prediction failed");
 
         _fund(alice);
         _fund(bob);

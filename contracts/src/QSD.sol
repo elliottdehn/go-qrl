@@ -2,13 +2,20 @@
 pragma solidity ^0.8.24;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {ERC20Burnable} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
+
+/// @dev Subset of YieldQSD that this contract calls. Defined inline
+///      to avoid a deploy-time circular dependency: YieldQSD takes
+///      QSD's address in its constructor, so QSD cannot directly
+///      import the contract type.
+interface IYieldQSD {
+    function distribute(uint256 amount) external;
+}
 
 /// @title  Quantum Stable Dollar (QSD)
 /// @notice USD-denominated stablecoin backed by a symmetric pool of
@@ -62,6 +69,14 @@ contract QSD is ERC20, ReentrancyGuard {
 
     /// @notice The QRL/USD price oracle.
     IPriceOracle public immutable oracle;
+
+    /// @notice The yQSD staking contract that receives leverage-facility
+    ///         interest as iQRL. Stakers of QSD into yQSD claim this
+    ///         flow pro-rata. Replacing the previous burn-on-receipt
+    ///         design: leverage interest is no longer destroyed but
+    ///         routed to a yield primitive that bootstraps QSD-pool
+    ///         liquidity by giving holders a real yield.
+    IYieldQSD public immutable yieldQsd;
 
     /// @notice QRL held by the pool. Tracked explicitly rather than
     ///         read from address(this).balance, to immunize against
@@ -188,7 +203,7 @@ contract QSD is ERC20, ReentrancyGuard {
         address indexed owner,
         uint256 qrlOwed,
         uint256 iqrlOwed,
-        uint256 feeIqrlBurned,
+        uint256 feeIqrlPaid,
         uint256 rateBps,
         uint64 deadline
     );
@@ -210,9 +225,12 @@ contract QSD is ERC20, ReentrancyGuard {
         bool forced
     );
 
-    constructor(IERC20 _iqrl, IPriceOracle _oracle) ERC20("Quantum Stable Dollar", "QSD") {
+    constructor(IERC20 _iqrl, IPriceOracle _oracle, IYieldQSD _yieldQsd)
+        ERC20("Quantum Stable Dollar", "QSD")
+    {
         iqrl = _iqrl;
         oracle = _oracle;
+        yieldQsd = _yieldQsd;
     }
 
     // ------------------------------------------------------------------
@@ -634,8 +652,9 @@ contract QSD is ERC20, ReentrancyGuard {
     // own depth. A borrower:
     //
     //   1. Pays an iQRL fee upfront (linear utilization curve from 12%
-    //      to 24% APR, scaled to chosen duration). The fee is burned
-    //      immediately and is non-refundable on early settlement.
+    //      to 24% APR, scaled to chosen duration). The fee is routed
+    //      to yQSD stakers as iQRL rewards (see YieldQSD.distribute)
+    //      and is non-refundable on early settlement.
     //   2. Receives a sandbox account holding (qrlOwed, iqrlOwed) at
     //      the pool's current marginal ratio. Pool reserves drop by the
     //      same amounts; aggregate (pool + lent) is preserved.
@@ -726,7 +745,7 @@ contract QSD is ERC20, ReentrancyGuard {
     /// @return positionId       Identifier for the new position.
     /// @return iqrlAmount       Amount of iQRL pulled from pool into
     ///                          the borrower's sandbox.
-    /// @return feeIqrl          Actual iQRL fee burned (≤ maxFeeIqrl).
+    /// @return feeIqrl          Actual iQRL fee paid to yQSD (≤ maxFeeIqrl).
     function openPosition(uint128 qrlAmount, uint64 durationSeconds, uint256 maxFeeIqrl)
         external
         nonReentrant
@@ -859,10 +878,14 @@ contract QSD is ERC20, ReentrancyGuard {
         feeIqrl = _computeFeeIqrl(uint256(qrlAmount), iqrlAmount, p, rateBps, durationSeconds);
         if (feeIqrl > maxFeeIqrl) revert InsufficientFee(feeIqrl, maxFeeIqrl);
 
-        // Burn the fee out of the borrower's iQRL balance via allowance.
-        // burnFrom consumes allowance and burns the tokens; the fee
-        // never enters this contract's accounting.
-        ERC20Burnable(address(iqrl)).burnFrom(msg.sender, feeIqrl);
+        // Route the fee to yQSD stakers. Pull the borrower's iQRL into
+        // this contract, then push it to yQSD via distribute(). yQSD
+        // updates its accRewardPerShare and credits stakers pro-rata.
+        // The fee transitorily enters this contract's accounting (one
+        // block, one tx) but never affects pool reserves.
+        iqrl.safeTransferFrom(msg.sender, address(this), feeIqrl);
+        iqrl.safeIncreaseAllowance(address(yieldQsd), feeIqrl);
+        yieldQsd.distribute(feeIqrl);
 
         // Move tokens from pool to sandbox. Aggregate (pool + lent) is
         // preserved exactly; pool's k drops, lent's k rises, but the
