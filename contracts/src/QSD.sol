@@ -71,6 +71,22 @@ contract QSD is ERC20, ReentrancyGuard {
     ///         poolQRL — protects against unsolicited token transfers.
     uint256 public poolIQRL;
 
+    /// @notice Cumulative time-weighted spot price for TWAP queries.
+    ///         Units: 1e18-scaled `sqrt(poolIQRL / poolQRL)` integrated
+    ///         over elapsed seconds. Updated lazily on every state-
+    ///         mutating operation that affects the pool ratio (i.e.
+    ///         swaps; symmetric deposits/redeems leave the ratio
+    ///         unchanged but still update the timestamp anchor).
+    ///         Consumers (currently only InverseQRL.mint) maintain
+    ///         their own snapshots to compute TWAP over a window.
+    uint256 public priceCumulativeLast;
+
+    /// @notice Last block.timestamp at which `priceCumulativeLast`
+    ///         was rolled forward. Set on bootstrap deposit; updated
+    ///         by `_updatePriceCumulative` on every subsequent
+    ///         state-mutating operation.
+    uint64 public lastPriceUpdate;
+
     error EmptyPool();
     error OracleUnhealthy();
     error ZeroAmount();
@@ -150,6 +166,11 @@ contract QSD is ERC20, ReentrancyGuard {
         uint256 qrlIn = msg.value;
         if (qrlIn == 0) revert ZeroAmount();
 
+        // Roll the price accumulator forward at the OLD spot price
+        // before reserves change. Symmetric deposits don't move the
+        // ratio, but they do anchor the timestamp.
+        _updatePriceCumulative();
+
         uint256 supply = totalSupply();
         if (supply == 0) {
             // Bootstrap: first depositor sets the initial pool
@@ -160,6 +181,9 @@ contract QSD is ERC20, ReentrancyGuard {
             iqrlIn = maxIqrlIn;
             if (iqrlIn == 0) revert ZeroAmount();
             qsdMinted = 2 * Math.sqrt(qrlIn * iqrlIn);
+            // Initialize the TWAP timestamp anchor; the spot price
+            // implied by these reserves applies from now forward.
+            lastPriceUpdate = uint64(block.timestamp);
         } else {
             // Symmetric deposit at pool's marginal ratio.
             iqrlIn = (qrlIn * poolIQRL) / poolQRL;
@@ -213,6 +237,11 @@ contract QSD is ERC20, ReentrancyGuard {
 
         uint256 supply = totalSupply();
         if (supply == 0) revert EmptyPool();
+
+        // Roll the price accumulator forward at the OLD spot price
+        // before reserves change. Pro-rata redemption doesn't move
+        // the ratio, but anchors the timestamp.
+        _updatePriceCumulative();
 
         // Pro-rata-by-supply slice. Integer division rounds payouts
         // DOWN, which favors the pool and tightens solvency.
@@ -286,6 +315,12 @@ contract QSD is ERC20, ReentrancyGuard {
         if (amountIn == 0) revert ZeroAmount();
         if (poolQRL == 0 || poolIQRL == 0) revert EmptyPool();
 
+        // Roll the price accumulator forward at the PRE-swap spot
+        // before mutating reserves. This is the only path that
+        // changes the pool ratio, so this is where the TWAP signal
+        // accumulates against time.
+        _updatePriceCumulative();
+
         uint256 kBefore = poolQRL * poolIQRL;
 
         // x * y = k:
@@ -321,6 +356,9 @@ contract QSD is ERC20, ReentrancyGuard {
     {
         if (amountIn == 0) revert ZeroAmount();
         if (poolQRL == 0 || poolIQRL == 0) revert EmptyPool();
+
+        // Roll the price accumulator forward at the PRE-swap spot.
+        _updatePriceCumulative();
 
         uint256 kBefore = poolQRL * poolIQRL;
 
@@ -437,5 +475,52 @@ contract QSD is ERC20, ReentrancyGuard {
     function _payNative(address to, uint256 amount) internal {
         (bool ok, ) = to.call{value: amount}("");
         if (!ok) revert NativeTransferFailed();
+    }
+
+    // ------------------------------------------------------------------
+    // Price oracle (TWAP)
+    // ------------------------------------------------------------------
+
+    /// @dev Roll `priceCumulativeLast` forward to `block.timestamp`
+    ///      using the spot price implied by the current reserves
+    ///      (BEFORE any state mutation in the calling function).
+    ///      Spot is `sqrt(poolIQRL / poolQRL)` in 1e18 fixed point,
+    ///      derived from the inverse-priced-pair USD equivalence
+    ///      `B / A = p^2`.
+    ///
+    ///      Idempotent within a block: if `block.timestamp ==
+    ///      lastPriceUpdate` no contribution is added, which makes
+    ///      the cumulative flash-loan resistant (intra-block
+    ///      manipulation cannot move the integrated value).
+    function _updatePriceCumulative() internal {
+        uint64 nowTs = uint64(block.timestamp);
+        if (lastPriceUpdate == 0) {
+            // Pool not yet bootstrapped.
+            return;
+        }
+        if (nowTs > lastPriceUpdate && poolQRL > 0 && poolIQRL > 0) {
+            uint256 elapsed = uint256(nowTs - lastPriceUpdate);
+            uint256 spot = Math.sqrt((poolIQRL * SCALE * SCALE) / poolQRL);
+            priceCumulativeLast += spot * elapsed;
+        }
+        lastPriceUpdate = nowTs;
+    }
+
+    /// @notice Read the cumulative price extrapolated to the current
+    ///         block. External readers store the returned tuple as a
+    ///         snapshot and compute TWAP across two snapshots as
+    ///         `(c2 - c1) / (t2 - t1)`. Returns zeros when the pool
+    ///         has never been bootstrapped.
+    /// @return cumulative Cumulative spot price scaled by 1e18,
+    ///                    integrated over seconds.
+    /// @return timestamp  block.timestamp at the read point.
+    function priceCumulativeNow() external view returns (uint256 cumulative, uint64 timestamp) {
+        timestamp = uint64(block.timestamp);
+        cumulative = priceCumulativeLast;
+        if (lastPriceUpdate != 0 && lastPriceUpdate < timestamp && poolQRL > 0 && poolIQRL > 0) {
+            uint256 elapsed = uint256(timestamp - lastPriceUpdate);
+            uint256 spot = Math.sqrt((poolIQRL * SCALE * SCALE) / poolQRL);
+            cumulative += spot * elapsed;
+        }
     }
 }

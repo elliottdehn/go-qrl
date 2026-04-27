@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {Script, console2} from "forge-std/Script.sol";
 
 import {ValidatorOracle} from "../src/ValidatorOracle.sol";
-import {InverseQRL} from "../src/InverseQRL.sol";
+import {InverseQRL, IQsdPool} from "../src/InverseQRL.sol";
 import {QSD} from "../src/QSD.sol";
 import {PayWithIQRL} from "../src/PayWithIQRL.sol";
 import {IPriceOracle} from "../src/interfaces/IPriceOracle.sol";
@@ -67,10 +67,12 @@ contract PredeployScript is Script {
         );
         _relocate(address(oracleSrc), ORACLE_ADDR);
 
-        // 2. InverseQRL — constructor takes the oracle address, which
-        //    bakes into its `oracle` immutable. Pass the RESERVED
-        //    address so the immutable points at the predeploy slot.
-        InverseQRL iqrlSrc = new InverseQRL(IPriceOracle(ORACLE_ADDR));
+        // 2. InverseQRL — constructor takes the oracle address AND
+        //    the QSD pool address (which iQRL.mint reads to compute
+        //    the TWAP-side mint price). Both bake into immutables.
+        //    Pass the RESERVED addresses so the immutables point at
+        //    the predeploy slots even though QSD is relocated next.
+        InverseQRL iqrlSrc = new InverseQRL(IPriceOracle(ORACLE_ADDR), IQsdPool(QSD_ADDR));
         _relocate(address(iqrlSrc), IQRL_ADDR);
 
         // 3. QSD — constructor takes iqrl + oracle. Same reasoning.

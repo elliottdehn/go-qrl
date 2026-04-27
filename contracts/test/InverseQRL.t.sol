@@ -5,10 +5,12 @@ import {Test, console2} from "forge-std/Test.sol";
 
 import {InverseQRL} from "../src/InverseQRL.sol";
 import {MockPriceOracle} from "./mocks/MockPriceOracle.sol";
+import {MockQsdPool} from "./mocks/MockQsdPool.sol";
 
 contract InverseQRLTest is Test {
     InverseQRL internal iqrl;
     MockPriceOracle internal oracle;
+    MockQsdPool internal pool;
 
     address internal alice = address(0xA11CE);
     address internal bob = address(0xB0B);
@@ -17,7 +19,8 @@ contract InverseQRLTest is Test {
 
     function setUp() public {
         oracle = new MockPriceOracle(ONE); // $1 per QRL
-        iqrl = new InverseQRL(oracle);
+        pool = new MockQsdPool();
+        iqrl = new InverseQRL(oracle, pool);
 
         vm.deal(alice, 1e30);
         vm.deal(bob, 1e30);
@@ -89,10 +92,13 @@ contract InverseQRLTest is Test {
         iqrl.mint{value: ONE}(ONE);
     }
 
-    function test_Mint_RevertsWhenOracleUnhealthy() public {
+    function test_Mint_RevertsWhenBothPriceSourcesUnavailable() public {
+        // Oracle unhealthy AND no TWAP snapshot established yet:
+        // mint has no price source and must revert with
+        // PriceUnavailable.
         oracle.setHealthy(false);
         vm.prank(alice);
-        vm.expectRevert(InverseQRL.OracleUnhealthy.selector);
+        vm.expectRevert(InverseQRL.PriceUnavailable.selector);
         iqrl.mint{value: 2 * ONE}(ONE);
     }
 
@@ -197,17 +203,34 @@ contract InverseQRLTest is Test {
     // oracle health
     // ------------------------------------------------------------------
 
-    function test_OracleUnhealthy_BlocksMint() public {
+    function test_OracleUnhealthy_NoTwap_BlocksMint() public {
+        // Oracle unhealthy AND no TWAP snapshot: both price sources
+        // unavailable, mint reverts with PriceUnavailable.
         oracle.setHealthy(false);
         vm.prank(alice);
-        vm.expectRevert(InverseQRL.OracleUnhealthy.selector);
+        vm.expectRevert(InverseQRL.PriceUnavailable.selector);
         iqrl.mint{value: 2 * ONE}(ONE);
     }
 
-    function test_OracleUnhealthy_BlocksQuoteMint() public {
+    function test_OracleUnhealthy_NoTwap_BlocksQuoteMint() public {
         oracle.setHealthy(false);
-        vm.expectRevert(InverseQRL.OracleUnhealthy.selector);
+        vm.expectRevert(InverseQRL.PriceUnavailable.selector);
         iqrl.quoteMint(ONE);
+    }
+
+    function test_OracleUnhealthy_TwapAvailable_MintSucceeds() public {
+        // Bootstrap a TWAP snapshot via a successful mint while
+        // oracle is healthy. Initial spot price = $1.
+        pool.setSpotPrice(ONE);
+        _mintExact(alice, ONE / 10);
+
+        // Wait past MIN_TWAP_WINDOW.
+        vm.warp(block.timestamp + iqrl.MIN_TWAP_WINDOW() + 1);
+
+        // Now break the oracle. Pool TWAP should carry mint.
+        oracle.setHealthy(false);
+        uint256 spent = _mintExact(alice, ONE / 10);
+        assertGt(spent, 0, "TWAP-priced mint should succeed when oracle is down");
     }
 
     function test_OracleUnhealthy_BurnStillWorks() public {
@@ -245,13 +268,61 @@ contract InverseQRLTest is Test {
     function test_OracleRecovers_MintAgainSucceeds() public {
         oracle.setHealthy(false);
         vm.prank(alice);
-        vm.expectRevert(InverseQRL.OracleUnhealthy.selector);
+        vm.expectRevert(InverseQRL.PriceUnavailable.selector);
         iqrl.mint{value: 2 * ONE}(ONE);
 
         oracle.setHealthy(true);
         uint256 spent = _mintExact(alice, ONE);
         assertGt(spent, 0);
         assertEq(iqrl.balanceOf(alice), ONE);
+    }
+
+    // ------------------------------------------------------------------
+    // mint-price source selection (min(oracle, TWAP))
+    // ------------------------------------------------------------------
+
+    function test_Mint_PicksOracleWhenLower() public {
+        // Bootstrap TWAP at p=$2 (more iQRL per QRL → cheaper mint),
+        // oracle stays at p=$1 (more expensive). min should pick
+        // oracle, charging the higher cost.
+        pool.setSpotPrice(2 * ONE);
+        _mintExact(alice, ONE / 10);
+        vm.warp(block.timestamp + iqrl.MIN_TWAP_WINDOW() + 1);
+
+        // Oracle still at $1; TWAP averages toward $2.
+        // Cost at p=$1 is iqrlAmount/p^2 = iqrlAmount * 1.005 (+ fee).
+        // Cost at p=$2 is iqrlAmount/4 * 1.005.
+        // Oracle (lower price) → higher cost → that's what we charge.
+        (uint256 cost,) = iqrl.quoteMint(ONE / 10);
+        // Cost should be near (ONE / 10) * 1.005, NOT (ONE / 40) * 1.005.
+        assertGt(cost, ONE / 12, "should reflect oracle p=$1, not pool p=$2");
+    }
+
+    function test_Mint_PicksTwapWhenLower() public {
+        // Symmetric: bootstrap TWAP at p=$0.5 (more expensive mint),
+        // oracle at $1. min picks pool (lower price → higher cost).
+        pool.setSpotPrice(ONE / 2);
+        _mintExact(alice, ONE / 10);
+        vm.warp(block.timestamp + iqrl.MIN_TWAP_WINDOW() + 1);
+
+        // At p=$0.5, cost = iqrlAmount / 0.25 = 4 * iqrlAmount, plus fee.
+        // At p=$1.0, cost = iqrlAmount, plus fee.
+        // The TWAP path charges much more.
+        (uint256 cost,) = iqrl.quoteMint(ONE / 10);
+        assertGt(cost, 3 * ONE / 10, "should reflect pool p=$0.5, not oracle p=$1");
+    }
+
+    function test_Mint_TwapWindowTooShort_FallsBackToOracle() public {
+        // Bootstrap TWAP at p=$0.5 with snapshot, but mint again
+        // before MIN_TWAP_WINDOW elapses. TWAP must be ignored.
+        pool.setSpotPrice(ONE / 2);
+        _mintExact(alice, ONE / 10);
+        vm.warp(block.timestamp + 1); // way under MIN_TWAP_WINDOW
+
+        // TWAP unavailable → oracle alone (p=$1) → cost ≈ iqrlAmount.
+        (uint256 cost,) = iqrl.quoteMint(ONE / 10);
+        // Cost should be near (ONE / 10) * 1.005, NOT 4x that.
+        assertLt(cost, 2 * ONE / 10, "TWAP under MIN_TWAP_WINDOW should be ignored");
     }
 
     // ------------------------------------------------------------------
