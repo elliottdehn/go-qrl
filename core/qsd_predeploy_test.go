@@ -57,8 +57,8 @@ func TestAddQSDStabilityLayerInjectsAllReservedEntries(t *testing.T) {
 	owner := common.BytesToAddress(common.FromHex("0xc0ffee0000000000000000000000000000000000"))
 	AddQSDStabilityLayer(alloc, DefaultQSDPredeployParams(owner))
 
-	if len(alloc) != 5 {
-		t.Fatalf("expected 5 entries, got %d", len(alloc))
+	if len(alloc) != 6 {
+		t.Fatalf("expected 6 entries, got %d", len(alloc))
 	}
 	for _, want := range []common.Address{
 		ValidatorOracleAddress,
@@ -66,6 +66,7 @@ func TestAddQSDStabilityLayerInjectsAllReservedEntries(t *testing.T) {
 		QSDAddress,
 		PayWithIQRLAddress,
 		YieldQSDAddress,
+		YieldQSDDeskAddress,
 	} {
 		if _, ok := alloc[want]; !ok {
 			t.Fatalf("missing reserved address %s", want.Hex())

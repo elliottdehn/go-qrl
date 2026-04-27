@@ -91,6 +91,7 @@ var (
 	QSDAddress             = common.BytesToAddress(common.FromHex("0x0000000000000000000000000000000000010002"))
 	PayWithIQRLAddress     = common.BytesToAddress(common.FromHex("0x0000000000000000000000000000000000010003"))
 	YieldQSDAddress        = common.BytesToAddress(common.FromHex("0x0000000000000000000000000000000000010004"))
+	YieldQSDDeskAddress    = common.BytesToAddress(common.FromHex("0x0000000000000000000000000000000000010005"))
 )
 
 // QSDPredeployParams configures the genesis-time deployment of the
@@ -157,6 +158,7 @@ func AddQSDStabilityLayer(alloc GenesisAlloc, _ QSDPredeployParams) {
 		QSDAddress,
 		PayWithIQRLAddress,
 		YieldQSDAddress,
+		YieldQSDDeskAddress,
 	} {
 		// Foundry's vm.dumpState writes 0x-prefixed lower-case keys;
 		// common.Address.Hex() on this fork returns Q-prefixed, so we
@@ -203,6 +205,7 @@ func InstallQSDPredeploysIfMissing(sdb *state.StateDB) error {
 		QSDAddress,
 		PayWithIQRLAddress,
 		YieldQSDAddress,
+		YieldQSDDeskAddress,
 	} {
 		key := "0x" + common.Bytes2Hex(addr.Bytes())
 		acct, ok := dump[key]
