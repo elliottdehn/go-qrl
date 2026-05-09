@@ -128,9 +128,10 @@ contract QSD is ERC20, ReentrancyGuard {
     ///         Charged at zero pool utilization.
     uint256 public constant LEVERAGE_MIN_RATE_BPS = 1200;
 
-    /// @notice Interest rate ceiling in basis points / year (24% APR).
+    /// @notice Interest rate ceiling in basis points / year (40% APR).
     ///         Charged when 50% of the pool (the cap) is loaned out.
-    uint256 public constant LEVERAGE_MAX_RATE_BPS = 2400;
+    ///         At max-on-both, per-QSD yield = 0.5 * 0.40 = 20% APY.
+    uint256 public constant LEVERAGE_MAX_RATE_BPS = 4000;
 
     /// @notice Maximum fraction of the pool's total token holdings that
     ///         may be loaned out at any time, expressed in basis points.
@@ -666,7 +667,7 @@ contract QSD is ERC20, ReentrancyGuard {
     // own depth. A borrower:
     //
     //   1. Pays an iQRL fee upfront (linear utilization curve from 12%
-    //      to 24% APR, scaled to chosen duration). The fee is routed
+    //      to 40% APR, scaled to chosen duration). The fee is routed
     //      to QSD holders pro-rata via the yield accumulator
     //      (_distributeYield) and is non-refundable on early settlement.
     //   2. Receives a sandbox account holding (qrlOwed, iqrlOwed) at
@@ -692,7 +693,7 @@ contract QSD is ERC20, ReentrancyGuard {
     ///         would apply to a zero-size additional borrow. New
     ///         loans actually pay the rate at *post-borrow*
     ///         utilization (see openPosition), so a borrower who
-    ///         takes utilization from 0% to 50% pays the 24% rate,
+    ///         takes utilization from 0% to 50% pays the 40% rate,
     ///         not 12%.
     function leverageRateBps() public view returns (uint256) {
         return _rateAt(lentQRL);

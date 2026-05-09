@@ -166,17 +166,17 @@ contract QSDLeverageTest is Test {
 
     function test_OpenPosition_BorrowerPaysPostBorrowRate() public {
         // A borrower taking utilization from 0 to 50% should pay the
-        // 24% rate (rate at the post-borrow state), not the 12% rate
+        // 40% rate (rate at the post-borrow state), not the 12% rate
         // at the pre-borrow state. Quote then open and check the
         // emitted rate.
         (uint256 quotedFee, , uint256 quotedRate) =
             qsd.quoteLeverageFee(uint128(500 * ONE), 1 days);
-        assertEq(quotedRate, 2400, "quoted rate is post-borrow (24%)");
+        assertEq(quotedRate, 4000, "quoted rate is post-borrow (40%)");
 
         // Quote at a partial borrow (0% → 25%) should give the
-        // mid-rate at u=25%: 12% + (24%-12%)*(0.25/0.5) = 18%.
+        // mid-rate at u=25%: 12% + (40%-12%)*(0.25/0.5) = 26%.
         (, , uint256 quotedMidRate) = qsd.quoteLeverageFee(uint128(250 * ONE), 1 days);
-        assertEq(quotedMidRate, 1800, "quoted rate at half-of-cap is 18%");
+        assertEq(quotedMidRate, 2600, "quoted rate at half-of-cap is 26%");
 
         // Open the half-borrow and verify the actual fee paid uses
         // the post-borrow rate (matches the quote).
@@ -184,9 +184,9 @@ contract QSDLeverageTest is Test {
         (, , uint256 actualFee) = qsd.openPosition(uint128(250 * ONE), 1 days, type(uint256).max);
 
         // Re-quote (now from u=25%) for a borrower who'd take it from
-        // 25% → 50%: rate at end u=50% = 24%.
+        // 25% → 50%: rate at end u=50% = 40%.
         (, , uint256 nextRate) = qsd.quoteLeverageFee(uint128(250 * ONE), 1 days);
-        assertEq(nextRate, 2400, "next borrower from u=25% to u=50% pays 24%");
+        assertEq(nextRate, 4000, "next borrower from u=25% to u=50% pays 40%");
         // Actual fee on the first half-borrow at quoted rate.
         assertEq(actualFee, quotedFee / 2 * 0 + actualFee, "fee captured");
         assertGt(actualFee, 0);
@@ -196,12 +196,12 @@ contract QSDLeverageTest is Test {
         // Cap = 50% of total. With pool=1000 lent=0, total=1000, cap=500
         // QRL. Maximum first-loan size is 500. After this loan,
         // pool=500, lent=500, total=1000, utilization=lent/total=50%.
-        // Rate at the cap should be LEVERAGE_MAX_RATE_BPS = 2400.
+        // Rate at the cap should be LEVERAGE_MAX_RATE_BPS = 4000.
         vm.prank(bob);
         qsd.openPosition(uint128(500 * ONE), 1 days, type(uint256).max);
 
-        // utilization = lent/(pool+lent) = 500/1000 = 50% — rate = 24%.
-        assertEq(qsd.leverageRateBps(), 2400, "max rate at u=cap");
+        // utilization = lent/(pool+lent) = 500/1000 = 50%, rate = 40%.
+        assertEq(qsd.leverageRateBps(), 4000, "max rate at u=cap");
     }
 
     function test_OpenPosition_RevertsBeyondCap() public {
