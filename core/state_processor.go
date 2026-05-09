@@ -71,8 +71,48 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 		signer  = types.MakeSigner(p.config)
 	)
 
-	// Iterate over and process the individual transactions
+	// At the QSD fork activation block (and every block thereafter,
+	// idempotently), make sure the four stability-layer predeploys
+	// are installed. Networks that bake them into genesis hit the
+	// fast path on the very first probe; networks that activate the
+	// fork mid-chain pay one full install on the activation block
+	// and the fast path forever after.
+	if p.config.IsQSD(header.Time) {
+		if err := InstallQSDPredeploysIfMissing(statedb); err != nil {
+			return nil, nil, 0, fmt.Errorf("qsd predeploy install: %w", err)
+		}
+	}
+
+	// Mirror the chain's PoS validator set into the ValidatorOracle
+	// predeploy via a system call BEFORE executing transactions, so
+	// any submitVote / free-vote machinery in this block sees the
+	// fresh set. Gated on the QSD fork: pre-fork blocks have no
+	// ValidatorOracle to mirror into. No-op when the body carries
+	// no validator list (e.g. blocks built before the engine API
+	// was extended to populate it).
+	if p.config.IsQSD(header.Time) {
+		if vs := block.Validators(); len(vs) > 0 {
+			if err := ProcessSetValidatorSet(vmenv, vs); err != nil {
+				return nil, nil, 0, fmt.Errorf("setValidatorSet system call: %w", err)
+			}
+		}
+	}
+
+	// Iterate over and process the individual transactions. The
+	// vote-ordering rule guarantees all submitVote txs come before
+	// any non-vote tx, so we can detect the phase transition by the
+	// first tx that fails IsSubmitVoteTx. At that boundary we fire
+	// the pokeCache system call: it rebuilds ValidatorOracle's
+	// per-block median over every vote that just landed, so the
+	// non-vote txs about to run read a fresh cache.
+	pokedCache := !p.config.IsQSD(header.Time) // pre-fork: nothing to poke
 	for i, tx := range block.Transactions() {
+		if !pokedCache && !IsSubmitVoteTx(tx) {
+			if err := ProcessPokeCache(vmenv); err != nil {
+				return nil, nil, 0, fmt.Errorf("pokeCache system call: %w", err)
+			}
+			pokedCache = true
+		}
 		msg, err := TransactionToMessage(tx, signer, header.BaseFee)
 		if err != nil {
 			return nil, nil, 0, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
@@ -84,6 +124,14 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 		}
 		receipts = append(receipts, receipt)
 		allLogs = append(allLogs, receipt.Logs...)
+	}
+	// Edge case: the block was all-votes (or empty). Fire pokeCache
+	// once at the end so the cache is fresh for any reader at the
+	// block boundary (e.g. RPC eth_call against `latest`).
+	if !pokedCache {
+		if err := ProcessPokeCache(vmenv); err != nil {
+			return nil, nil, 0, fmt.Errorf("pokeCache system call: %w", err)
+		}
 	}
 
 	// Finalize the block, applying any consensus engine specific extras (e.g. block rewards)

@@ -41,6 +41,7 @@ type BuildPayloadArgs struct {
 	FeeRecipient common.Address    // The provided recipient address for collecting transaction fee
 	Random       common.Hash       // The provided randomness value
 	Withdrawals  types.Withdrawals // The provided withdrawals
+	Validators   []common.Address  // Active PoS validator set; nil means "leave on-chain set unchanged".
 }
 
 // Id computes an 8-byte identifier by hashing the components of the payload arguments.
@@ -51,6 +52,7 @@ func (args *BuildPayloadArgs) Id() engine.PayloadID {
 	hasher.Write(args.Random[:])
 	hasher.Write(args.FeeRecipient[:])
 	rlp.Encode(hasher, args.Withdrawals)
+	rlp.Encode(hasher, args.Validators)
 	var out engine.PayloadID
 	copy(out[:], hasher.Sum(nil)[:8])
 	return out
@@ -180,6 +182,7 @@ func (miner *Miner) buildPayload(args *BuildPayloadArgs) (*Payload, error) {
 		coinbase:    args.FeeRecipient,
 		random:      args.Random,
 		withdrawals: args.Withdrawals,
+		validators:  args.Validators,
 		noTxs:       true,
 	}
 	empty := miner.generateWork(emptyParams)
@@ -210,6 +213,7 @@ func (miner *Miner) buildPayload(args *BuildPayloadArgs) (*Payload, error) {
 			coinbase:    args.FeeRecipient,
 			random:      args.Random,
 			withdrawals: args.Withdrawals,
+			validators:  args.Validators,
 			noTxs:       false,
 		}
 

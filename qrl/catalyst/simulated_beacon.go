@@ -120,6 +120,17 @@ func (c *SimulatedBeacon) setFeeRecipient(feeRecipient common.Address) {
 	c.feeRecipientLock.Unlock()
 }
 
+// SetFeeRecipient is the package-public form of setFeeRecipient,
+// used by --dev-mode bring-up to seed the recipient before any
+// blocks get sealed. Without this the recipient defaults to the
+// zero address; that's harmless for native-fee txs (state.AddBalance
+// to address(0) is a no-op) but breaks ERC-20 paymaster settlement,
+// where token.transfer(address(0), ...) reverts under
+// OpenZeppelin v5's ERC20InvalidReceiver check.
+func (c *SimulatedBeacon) SetFeeRecipient(feeRecipient common.Address) {
+	c.setFeeRecipient(feeRecipient)
+}
+
 // Start invokes the SimulatedBeacon life-cycle function in a goroutine.
 func (c *SimulatedBeacon) Start() error {
 	if c.period == 0 {

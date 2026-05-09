@@ -466,9 +466,22 @@ func (l *list) subTotalCost(txs []*types.Transaction) {
 // price-sorted transactions to discard when the pool fills up. If baseFee is set
 // then the heap is sorted based on the effective tip based on the given base fee.
 // If baseFee is nil then the sorting is based on gasFeeCap.
+//
+// For paymaster txs, the gas price is denominated in iQRL rather than QRL.
+// Comparing those raw against QRL prices would systematically underprice
+// paymaster txs (since 1 iQRL is worth 1/p^2 QRL). When paymasterFactorNum
+// and paymasterFactorDen are non-nil, paymaster txs' gas prices are
+// converted to QRL-equivalent before comparison via:
+//
+//	qrlEquivalent = paymasterGasPrice * paymasterFactorNum / paymasterFactorDen
+//
+// Both factors are kept as a numerator/denominator pair to defer the
+// integer division until the final comparison and avoid loss of precision.
 type priceHeap struct {
-	baseFee *big.Int // heap should always be re-sorted after baseFee is changed
-	list    []*types.Transaction
+	baseFee             *big.Int // heap should always be re-sorted after baseFee is changed
+	paymasterFactorNum  *big.Int // 1e36 (= SCALE^2) when set
+	paymasterFactorDen  *big.Int // p^2 where p is the oracle price scaled by 1e18
+	list                []*types.Transaction
 }
 
 func (h *priceHeap) Len() int      { return len(h.list) }
@@ -486,18 +499,52 @@ func (h *priceHeap) Less(i, j int) bool {
 }
 
 func (h *priceHeap) cmp(a, b *types.Transaction) int {
-	if h.baseFee != nil {
-		// Compare effective tips if baseFee is specified
-		if c := a.EffectiveGasTipCmp(b, h.baseFee); c != 0 {
-			return c
-		}
+	ta := h.effectiveQrlTip(a)
+	tb := h.effectiveQrlTip(b)
+	if c := ta.Cmp(tb); c != 0 {
+		return c
 	}
-	// Compare fee caps if baseFee is not specified or effective tips are equal
+	// Tiebreaker on gasFeeCap then gasTipCap, comparing in raw signed
+	// units. This is fine even when one tx is paymaster and the other
+	// native: the primary comparison already converted to QRL terms,
+	// so reaching the tiebreaker means the signed values are
+	// "equivalent enough" that exact ordering between them is best
+	// effort. Falling back to nonce ordering after this preserves the
+	// existing behaviour for both classes in isolation.
 	if c := a.GasFeeCapCmp(b); c != 0 {
 		return c
 	}
-	// Compare tips if effective tips and fee caps are equal
 	return a.GasTipCapCmp(b)
+}
+
+// effectiveQrlTip returns the QRL-equivalent fee per gas that the
+// validator would actually earn from including `tx`. For native txs
+// this is the EIP-1559 effective tip (min of tipCap and the
+// fee-cap-minus-base-fee headroom). For paymaster txs the validator
+// receives the entire signed gasPrice in iQRL, converted to QRL
+// terms via the priceHeap's paymaster factor. When the factor is
+// not set (oracle unhealthy or pool not yet primed) paymaster txs
+// receive zero priority, ensuring they don't squeeze out native
+// txs with real bids during an oracle outage.
+func (h *priceHeap) effectiveQrlTip(tx *types.Transaction) *big.Int {
+	if tx.Paymaster() == nil {
+		if h.baseFee == nil {
+			return tx.GasFeeCap()
+		}
+		avail := new(big.Int).Sub(tx.GasFeeCap(), h.baseFee)
+		if avail.Sign() < 0 {
+			return new(big.Int)
+		}
+		if avail.Cmp(tx.GasTipCap()) > 0 {
+			return new(big.Int).Set(tx.GasTipCap())
+		}
+		return avail
+	}
+	if h.paymasterFactorDen == nil || h.paymasterFactorDen.Sign() == 0 {
+		return new(big.Int)
+	}
+	out := new(big.Int).Mul(tx.GasPrice(), h.paymasterFactorNum)
+	return out.Div(out, h.paymasterFactorDen)
 }
 
 func (h *priceHeap) Push(x any) {
@@ -676,4 +723,40 @@ func (l *pricedList) Reheap() {
 func (l *pricedList) SetBaseFee(baseFee *big.Int) {
 	l.urgent.baseFee = baseFee
 	l.Reheap()
+}
+
+// SetPaymasterFactor updates the iQRL→QRL conversion factor used when
+// comparing paymaster txs against native txs. p is the oracle's
+// median QRL/USD price, scaled by 1e18; healthy reports whether the
+// oracle is currently emitting a valid quote.
+//
+// Pass healthy=false (or p=0) to clear the factor: in that case
+// paymaster txs are treated as zero-priority for the duration of
+// the outage. The pool already evicts paymaster txs lazily on
+// admission failures, so they won't accumulate forever — the floor
+// just keeps an unhealthy oracle from corrupting native-tx pricing.
+func (l *pricedList) SetPaymasterFactor(p *big.Int, healthy bool) {
+	num, den := paymasterFactor(p, healthy)
+	l.urgent.paymasterFactorNum = num
+	l.urgent.paymasterFactorDen = den
+	l.floating.paymasterFactorNum = num
+	l.floating.paymasterFactorDen = den
+	l.Reheap()
+}
+
+// paymasterScale is 1e36 = (1e18)^2, the factor that cancels out the
+// 1e18 fixed-point scaling on the squared oracle price.
+var paymasterScale = new(big.Int).Mul(
+	new(big.Int).SetUint64(1_000_000_000_000_000_000),
+	new(big.Int).SetUint64(1_000_000_000_000_000_000),
+)
+
+// paymasterFactor derives (num, den) for the QRL-equivalent
+// conversion. Returns (nil, nil) when the oracle is unhealthy or
+// the price is zero.
+func paymasterFactor(p *big.Int, healthy bool) (num, den *big.Int) {
+	if !healthy || p == nil || p.Sign() == 0 {
+		return nil, nil
+	}
+	return new(big.Int).Set(paymasterScale), new(big.Int).Mul(p, p)
 }

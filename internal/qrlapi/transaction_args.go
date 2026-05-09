@@ -52,6 +52,13 @@ type TransactionArgs struct {
 
 	AccessList *types.AccessList `json:"accessList,omitempty"`
 	ChainID    *hexutil.Big      `json:"chainId,omitempty"`
+
+	// Paymaster, when non-nil, requests construction of a
+	// PaymasterDynamicFeeTx (type 0x04) instead of the standard
+	// DynamicFeeTx. The named address must be on the chain's
+	// paymaster allowlist (see core.IsAllowedPaymaster) — otherwise
+	// the tx will be rejected at admission and at execution.
+	Paymaster *common.Address `json:"paymaster,omitempty"`
 }
 
 // from retrieves the transaction sender address.
@@ -259,6 +266,22 @@ func (args *TransactionArgs) toTransaction() *types.Transaction {
 	al := types.AccessList{}
 	if args.AccessList != nil {
 		al = *args.AccessList
+	}
+
+	if args.Paymaster != nil {
+		data = &types.PaymasterDynamicFeeTx{
+			To:         args.To,
+			ChainID:    (*big.Int)(args.ChainID),
+			Nonce:      uint64(*args.Nonce),
+			Gas:        uint64(*args.Gas),
+			GasFeeCap:  (*big.Int)(args.MaxFeePerGas),
+			GasTipCap:  (*big.Int)(args.MaxPriorityFeePerGas),
+			Value:      (*big.Int)(args.Value),
+			Data:       args.data(),
+			AccessList: al,
+			Paymaster:  args.Paymaster,
+		}
+		return types.NewTx(data)
 	}
 
 	data = &types.DynamicFeeTx{

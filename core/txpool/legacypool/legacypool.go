@@ -279,7 +279,7 @@ func New(config Config, chain BlockChain) *LegacyPool {
 // pool.
 func (pool *LegacyPool) Filter(tx *types.Transaction) bool {
 	switch tx.Type() {
-	case types.DynamicFeeTxType:
+	case types.DynamicFeeTxType, types.PaymasterDynamicFeeTxType:
 		return true
 	default:
 		return false
@@ -540,9 +540,18 @@ func (pool *LegacyPool) Pending(filter txpool.PendingFilter) map[common.Address]
 	for addr, list := range pool.pending {
 		txs := list.Flatten()
 
-		// If the miner requests tip enforcement, cap the lists now
+		// If the miner requests tip enforcement, cap the lists now.
+		// Paymaster txs are exempt from this filter — their fee is
+		// denominated in the paymaster's chosen asset (e.g. iQRL),
+		// not in native QRL, so a direct EffectiveGasTip comparison
+		// against the QRL minTip is a unit error. Block-builder
+		// fairness lives in the priced heap; the miner just needs
+		// to not stall the nonce queue here.
 		if minTipBig != nil && !pool.locals.contains(addr) {
 			for i, tx := range txs {
+				if tx.Paymaster() != nil {
+					continue
+				}
 				if tx.EffectiveGasTipIntCmp(minTipBig, baseFeeBig) < 0 {
 					txs = txs[:i]
 					break
@@ -597,10 +606,17 @@ func (pool *LegacyPool) local() map[common.Address]types.Transactions {
 // This check is meant as an early check which only needs to be performed once,
 // and does not require the pool mutex to be held.
 func (pool *LegacyPool) validateTxBasics(tx *types.Transaction, local bool) error {
+	// Type-0x04 paymaster transactions are accepted only on chains
+	// where the QSD stability-layer fork has activated by the
+	// current head's timestamp. Pre-fork they're a future format
+	// the chain does not yet understand and must not be admitted.
+	accept := uint8(1 << types.DynamicFeeTxType)
+	if head := pool.currentHead.Load(); head != nil && pool.chainconfig.IsQSD(head.Time) {
+		accept |= 1 << types.PaymasterDynamicFeeTxType
+	}
 	opts := &txpool.ValidationOptions{
-		Config: pool.chainconfig,
-		Accept: 0 |
-			1<<types.DynamicFeeTxType,
+		Config:  pool.chainconfig,
+		Accept:  accept,
 		MaxSize: txMaxSize,
 		MinTip:  pool.gasTip.Load(),
 	}
@@ -1421,6 +1437,83 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 	log.Debug("Reinjecting stale transactions", "count", len(reinject))
 	core.SenderCacher.Recover(pool.signer, reinject)
 	pool.addTxsLocked(reinject, false)
+
+	// Evict submitVote() txs whose target block has already been
+	// produced. The strict-block check on ValidatorOracle guarantees
+	// they would revert (WrongBlockNumber) on inclusion, so keeping
+	// them around just wastes propagation bandwidth and validator gas.
+	pool.evictStaleVotes(newHead.Number.Uint64())
+
+	// Refresh the paymaster fairness factor from the oracle's cached
+	// median price + health. Lets the priced heap compare iQRL-paid
+	// txs against native-paid txs in QRL-equivalent terms.
+	pool.refreshPaymasterFactor()
+}
+
+// refreshPaymasterFactor recomputes the oracle's median price +
+// health from raw validator votes and pushes the resulting iQRL→QRL
+// conversion factor into the priced heap. Bypasses the on-chain
+// per-block cache, which may be stale by one or more blocks if no
+// recent tx poked it.
+//
+// Safe to call without the oracle predeploy installed (returns a
+// zero/unhealthy reading, which deactivates the factor).
+func (pool *LegacyPool) refreshPaymasterFactor() {
+	if pool.currentState == nil {
+		return
+	}
+	currentBlock := uint64(0)
+	if head := pool.currentHead.Load(); head != nil {
+		currentBlock = head.Number.Uint64()
+	}
+	price, healthy := core.ComputeOraclePrice(pool.currentState, currentBlock)
+	pool.priced.SetPaymasterFactor(price, healthy)
+}
+
+// evictStaleVotes removes any submitVote() tx whose target
+// forBlockNumber is <= the latest-mined block. Such a tx can never
+// successfully execute again (the contract enforces forBlockNumber
+// == block.number, and block.number only grows).
+func (pool *LegacyPool) evictStaleVotes(latestMined uint64) {
+	var stale []common.Hash
+	pool.all.Range(func(hash common.Hash, tx *types.Transaction, _ bool) bool {
+		if forBlock, ok := submitVoteTargetBlock(tx); ok && forBlock <= latestMined {
+			stale = append(stale, hash)
+		}
+		return true
+	}, true, true)
+
+	for _, hash := range stale {
+		pool.removeTx(hash, true, true)
+	}
+	if len(stale) > 0 {
+		log.Debug("Evicted stale validator vote txs", "count", len(stale), "head", latestMined)
+	}
+}
+
+// submitVoteTargetBlock decodes the forBlockNumber argument out of a
+// submitVote(uint256,uint256) calldata payload, if `tx` is in fact
+// a submitVote tx aimed at the ValidatorOracle. The bool reports
+// whether the tx matches.
+func submitVoteTargetBlock(tx *types.Transaction) (uint64, bool) {
+	to := tx.To()
+	if to == nil || *to != core.ValidatorOracleAddress {
+		return 0, false
+	}
+	data := tx.Data()
+	if len(data) < 4+32+32 {
+		return 0, false
+	}
+	for i := 0; i < 4; i++ {
+		if data[i] != core.SubmitVoteSelector[i] {
+			return 0, false
+		}
+	}
+	// First arg occupies bytes [4, 36); big-endian uint256. We only
+	// care about the low 64 bits — anything larger can't possibly
+	// equal a real block.number, so it's stale by definition (and
+	// will be evicted next reset anyway).
+	return new(big.Int).SetBytes(data[4:36]).Uint64(), true
 }
 
 // promoteExecutables moves transactions that have become processable from the

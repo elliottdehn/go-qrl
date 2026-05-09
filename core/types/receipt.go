@@ -160,7 +160,7 @@ func (r *Receipt) decodeTyped(b []byte) error {
 		return errShortTypedReceipt
 	}
 	switch b[0] {
-	case DynamicFeeTxType:
+	case DynamicFeeTxType, PaymasterDynamicFeeTxType:
 		var data receiptRLP
 		err := rlp.DecodeBytes(b[1:], &data)
 		if err != nil {
@@ -264,7 +264,7 @@ func (rs Receipts) EncodeIndex(i int, w *bytes.Buffer) {
 	data := &receiptRLP{r.statusEncoding(), r.CumulativeGasUsed, r.Bloom, r.Logs}
 	w.WriteByte(r.Type)
 	switch r.Type {
-	case DynamicFeeTxType:
+	case DynamicFeeTxType, PaymasterDynamicFeeTxType:
 		rlp.Encode(w, data)
 	default:
 		// For unsupported types, write nothing. Since this is for

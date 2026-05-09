@@ -31,8 +31,7 @@ var (
 	TestnetGenesisHash = common.HexToHash("0x6a7659906cc310bbef84a9a934f1f5cffdf5487e5f43addcf0386e40396eebe7")
 )
 
-// NOTE(rgeraldes24): unused atm
-// func newUint64(val uint64) *uint64 { return &val }
+func newUint64(val uint64) *uint64 { return &val }
 
 var (
 	// MainnetChainConfig is the chain parameters to run a node on the main network.
@@ -50,12 +49,18 @@ var (
 
 	// AllBeaconProtocolChanges contains every protocol change (QIPs) introduced
 	// and accepted by the QRL core developers into the Beacon consensus.
+	// QSD is intentionally NOT enabled here: callers building a generic
+	// test genesis (e.g. blockchain_test.go) don't want the QSD predeploys
+	// auto-installed at block 1 since their test alloc isn't expecting it.
+	// QSD-specific tests use AllDevChainProtocolChanges, which DOES enable
+	// QSD and is paired with DeveloperGenesisBlock's predeploy alloc.
 	AllBeaconProtocolChanges = &ChainConfig{
 		ChainID: big.NewInt(1337),
 	}
 
 	AllDevChainProtocolChanges = &ChainConfig{
 		ChainID:   big.NewInt(1337),
+		QSDTime:   newUint64(0),
 		IsDevMode: true,
 	}
 
@@ -66,7 +71,7 @@ var (
 	}
 
 	// NonActivatedConfig defines the chain configuration without activating
-	// any protocol change (QIPs).
+	// any protocol change (QIPs). Use this to exercise pre-fork behavior.
 	NonActivatedConfig = &ChainConfig{
 		ChainID: big.NewInt(1),
 	}
@@ -85,6 +90,15 @@ var NetworkNames = map[string]string{
 // set of configuration options.
 type ChainConfig struct {
 	ChainID *big.Int `json:"chainId"` // chainId identifies the current chain and is used for replay protection
+
+	// QSDTime, if set, schedules activation of the QSD stability
+	// layer at the first block whose header.Time is >= *QSDTime.
+	// Pre-activation blocks see no predeploys, no free votes, no
+	// validator-set system call, no proposer-vote rule, and no
+	// type-0x04 paymaster transactions. Post-activation blocks
+	// have the full QSD machinery turned on. nil means the fork
+	// is not scheduled on this chain.
+	QSDTime *uint64 `json:"qsdTime,omitempty"`
 
 	IsDevMode bool `json:"isDev,omitempty"`
 }
@@ -253,6 +267,13 @@ func (err *ConfigCompatError) Error() string {
 	return fmt.Sprintf("mismatching %s in database (have timestamp %d, want timestamp %d, rewindto timestamp %d)", err.What, err.StoredTime, err.NewTime, err.RewindToTime)
 }
 
+// IsQSD reports whether the QSD stability-layer fork has activated by
+// the given block timestamp. False if QSDTime is unset (the fork is
+// not scheduled on this chain).
+func (c *ChainConfig) IsQSD(time uint64) bool {
+	return c.QSDTime != nil && time >= *c.QSDTime
+}
+
 // Rules wraps ChainConfig and is merely syntactic sugar or can be used for functions
 // that do not have or require information about the block.
 //
@@ -260,6 +281,7 @@ func (err *ConfigCompatError) Error() string {
 // phases.
 type Rules struct {
 	ChainID *big.Int
+	IsQSD   bool
 }
 
 // Rules ensures c's ChainID is not nil.
@@ -270,5 +292,6 @@ func (c *ChainConfig) Rules(num *big.Int, timestamp uint64) Rules {
 	}
 	return Rules{
 		ChainID: new(big.Int).Set(chainID),
+		IsQSD:   c.IsQSD(timestamp),
 	}
 }
