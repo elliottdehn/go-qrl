@@ -3,8 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 
-import {QSD, IYieldQSD} from "../src/QSD.sol";
-import {YieldQSD} from "../src/YieldQSD.sol";
+import {QSD} from "../src/QSD.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockPriceOracle} from "./mocks/MockPriceOracle.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -109,18 +108,10 @@ contract QSDInvariantTest is Test {
     MockPriceOracle internal oracle;
     QSDHandler internal handler;
 
-    YieldQSD internal yqsd;
-
     function setUp() public {
         iqrl = new MockERC20("iQRL", "iQRL");
         oracle = new MockPriceOracle(1e18);
-
-        address predictedYqsd = vm.computeCreateAddress(
-            address(this), vm.getNonce(address(this)) + 1
-        );
-        qsd = new QSD(iqrl, oracle, IYieldQSD(predictedYqsd));
-        yqsd = new YieldQSD(IERC20(address(qsd)), iqrl);
-        require(address(yqsd) == predictedYqsd, "yqsd address prediction failed");
+        qsd = new QSD(iqrl, oracle);
 
         handler = new QSDHandler(qsd, iqrl, oracle);
 

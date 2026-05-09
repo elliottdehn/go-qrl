@@ -9,20 +9,6 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 
-/// @dev Subset of YieldQSD that this contract calls. Defined inline
-///      to avoid a deploy-time circular dependency: YieldQSD takes
-///      QSD's address in its constructor, so QSD cannot directly
-///      import the contract type.
-interface IYieldQSD {
-    /// Mint yQSD 1:1 alongside QSD on deposit.
-    function issueTo(address to, uint256 amount) external;
-    /// Burn yQSD 1:1 alongside QSD on redemption. Reverts if the
-    /// redeemer's yQSD balance is insufficient.
-    function redeemFrom(address from, uint256 amount) external;
-    /// Route an iQRL stream to yQSD holders pro-rata.
-    function distribute(uint256 amount) external;
-}
-
 /// @title  Quantum Stable Dollar (QSD)
 /// @notice USD-denominated stablecoin backed by a symmetric pool of
 ///         native QRL and its inverse (iQRL).
@@ -76,13 +62,33 @@ contract QSD is ERC20, ReentrancyGuard {
     /// @notice The QRL/USD price oracle.
     IPriceOracle public immutable oracle;
 
-    /// @notice The yQSD staking contract that receives leverage-facility
-    ///         interest as iQRL. Stakers of QSD into yQSD claim this
-    ///         flow pro-rata. Replacing the previous burn-on-receipt
-    ///         design: leverage interest is no longer destroyed but
-    ///         routed to a yield primitive that bootstraps QSD-pool
-    ///         liquidity by giving holders a real yield.
-    IYieldQSD public immutable yieldQsd;
+    // ------------------------------------------------------------------
+    // Yield accumulator (MasterChef pattern, folded into QSD)
+    // ------------------------------------------------------------------
+    //
+    // iQRL leverage interest is distributed to QSD holders pro-rata via
+    // a per-balance accumulator. Holders accrue rewards in proportion to
+    // QSD held; rewards are settled on every balance change (mint, burn,
+    // transfer) and pulled from the contract via claim().
+    //
+    // distribute() is called by the leverage facility on every position
+    // open (paid in iQRL by the borrower). The accumulator pattern
+    // ensures fair pro-rata distribution without per-holder iteration.
+
+    /// @notice Cumulative iQRL rewards per QSD share, 1e18-scaled.
+    ///         Monotone non-decreasing.
+    uint256 public accRewardPerShare;
+
+    /// @notice Per-holder snapshot of `balance * accRewardPerShare / SCALE`
+    ///         at last balance change. Standard MasterChef "rewardDebt".
+    mapping(address => uint256) public rewardDebt;
+
+    /// @notice Settled-but-not-yet-claimed iQRL rewards per holder.
+    ///         Drained by claim().
+    mapping(address => uint256) public pendingReward;
+
+    /// @notice Cumulative iQRL distributed to QSD holders (audit / view).
+    uint256 public totalDistributed;
 
     /// @notice QRL held by the pool. Tracked explicitly rather than
     ///         read from address(this).balance, to immunize against
@@ -231,12 +237,14 @@ contract QSD is ERC20, ReentrancyGuard {
         bool forced
     );
 
-    constructor(IERC20 _iqrl, IPriceOracle _oracle, IYieldQSD _yieldQsd)
+    event Distributed(uint256 amount, uint256 newAccRewardPerShare);
+    event Claimed(address indexed user, uint256 amount);
+
+    constructor(IERC20 _iqrl, IPriceOracle _oracle)
         ERC20("Quantum Stable Dollar", "QSD")
     {
         iqrl = _iqrl;
         oracle = _oracle;
-        yieldQsd = _yieldQsd;
     }
 
     // ------------------------------------------------------------------
@@ -321,10 +329,6 @@ contract QSD is ERC20, ReentrancyGuard {
         poolIQRL += iqrlIn;
 
         _mint(msg.sender, qsdMinted);
-        // Co-mint the yield claim 1:1 with QSD. Only the depositor
-        // receives yQSD; secondary buyers of QSD do not have yield
-        // rights and cannot redeem unless they acquire matching yQSD.
-        yieldQsd.issueTo(msg.sender, qsdMinted);
         _assertSolvent();
 
         emit Deposited(msg.sender, qrlIn, iqrlIn, qsdMinted);
@@ -378,10 +382,6 @@ contract QSD is ERC20, ReentrancyGuard {
         assert(iqrlReturned <= poolIQRL);
 
         _burn(msg.sender, qsdAmount);
-        // Burn the matching yQSD. Reverts if the redeemer doesn't
-        // have at least qsdAmount yQSD; this enforces the 1:1
-        // invariant between QSD and yQSD outstanding.
-        yieldQsd.redeemFrom(msg.sender, qsdAmount);
 
         poolQRL -= qrlReturned;
         poolIQRL -= iqrlReturned;
@@ -667,8 +667,8 @@ contract QSD is ERC20, ReentrancyGuard {
     //
     //   1. Pays an iQRL fee upfront (linear utilization curve from 12%
     //      to 24% APR, scaled to chosen duration). The fee is routed
-    //      to yQSD stakers as iQRL rewards (see YieldQSD.distribute)
-    //      and is non-refundable on early settlement.
+    //      to QSD holders pro-rata via the yield accumulator
+    //      (_distributeYield) and is non-refundable on early settlement.
     //   2. Receives a sandbox account holding (qrlOwed, iqrlOwed) at
     //      the pool's current marginal ratio. Pool reserves drop by the
     //      same amounts; aggregate (pool + lent) is preserved.
@@ -759,7 +759,7 @@ contract QSD is ERC20, ReentrancyGuard {
     /// @return positionId       Identifier for the new position.
     /// @return iqrlAmount       Amount of iQRL pulled from pool into
     ///                          the borrower's sandbox.
-    /// @return feeIqrl          Actual iQRL fee paid to yQSD (≤ maxFeeIqrl).
+    /// @return feeIqrl          Actual iQRL fee distributed to QSD holders (≤ maxFeeIqrl).
     function openPosition(uint128 qrlAmount, uint64 durationSeconds, uint256 maxFeeIqrl)
         external
         nonReentrant
@@ -892,14 +892,12 @@ contract QSD is ERC20, ReentrancyGuard {
         feeIqrl = _computeFeeIqrl(uint256(qrlAmount), iqrlAmount, p, rateBps, durationSeconds);
         if (feeIqrl > maxFeeIqrl) revert InsufficientFee(feeIqrl, maxFeeIqrl);
 
-        // Route the fee to yQSD stakers. Pull the borrower's iQRL into
-        // this contract, then push it to yQSD via distribute(). yQSD
-        // updates its accRewardPerShare and credits stakers pro-rata.
-        // The fee transitorily enters this contract's accounting (one
-        // block, one tx) but never affects pool reserves.
+        // Pull the borrower's iQRL fee and route it to QSD holders
+        // pro-rata via the internal accumulator. The fee enters this
+        // contract's iQRL balance and is held until claim() drains it
+        // per holder. Pool reserves are unaffected.
         iqrl.safeTransferFrom(msg.sender, address(this), feeIqrl);
-        iqrl.safeIncreaseAllowance(address(yieldQsd), feeIqrl);
-        yieldQsd.distribute(feeIqrl);
+        _distributeYield(feeIqrl);
 
         // Move tokens from pool to sandbox. Aggregate (pool + lent) is
         // preserved exactly; pool's k drops, lent's k rises, but the
@@ -1192,5 +1190,87 @@ contract QSD is ERC20, ReentrancyGuard {
         }
         if (takeQ > sQ) takeQ = sQ;
         if (takeI > sI) takeI = sI;
+    }
+
+    // ------------------------------------------------------------------
+    // Yield accumulator: claim, distribute, settle
+    // ------------------------------------------------------------------
+    //
+    // The accumulator follows the standard MasterChef pattern:
+    //
+    //   accRewardPerShare grows monotonically with each distribute() call.
+    //   rewardDebt[user]  = balanceOf(user) * accRewardPerShare / SCALE
+    //                       at the user's last balance change.
+    //   pendingReward[user] holds settled-but-unclaimed rewards.
+    //
+    // On every QSD balance change (mint, burn, transfer), _update settles
+    // both parties: it credits any unsettled accrual since the last
+    // snapshot into pendingReward, then re-anchors rewardDebt at the
+    // post-change balance. claim() drains pendingReward and transfers
+    // the iQRL out to the holder.
+
+    /// @notice Transfer all settled iQRL rewards to the caller.
+    /// @return amount Amount of iQRL transferred.
+    function claim() external nonReentrant returns (uint256 amount) {
+        _settleRewards(msg.sender);
+        amount = pendingReward[msg.sender];
+        if (amount == 0) return 0;
+        pendingReward[msg.sender] = 0;
+        iqrl.safeTransfer(msg.sender, amount);
+        emit Claimed(msg.sender, amount);
+    }
+
+    /// @notice View: pending iQRL rewards for `user`, including
+    ///         unsettled accruals since their last balance change.
+    function pending(address user) external view returns (uint256) {
+        uint256 credited = balanceOf(user) * accRewardPerShare / SCALE;
+        uint256 debt = rewardDebt[user];
+        uint256 unsettled = credited >= debt ? credited - debt : 0;
+        return pendingReward[user] + unsettled;
+    }
+
+    /// @dev Update accRewardPerShare with `amount` of iQRL distributed
+    ///      pro-rata across current QSD supply. Called by the leverage
+    ///      facility when collecting borrower fees. The iQRL must
+    ///      already sit in this contract's balance at the time of call.
+    function _distributeYield(uint256 amount) internal {
+        uint256 supply = totalSupply();
+        if (supply > 0) {
+            accRewardPerShare += (amount * SCALE) / supply;
+        }
+        totalDistributed += amount;
+        emit Distributed(amount, accRewardPerShare);
+    }
+
+    /// @dev Move newly-accrued rewards from the unsettled bucket
+    ///      (acc * balance - rewardDebt) into the settled bucket
+    ///      (pendingReward), then update rewardDebt at the current
+    ///      balance.
+    function _settleRewards(address user) internal {
+        if (user == address(0)) return;
+        uint256 credited = balanceOf(user) * accRewardPerShare / SCALE;
+        uint256 debt = rewardDebt[user];
+        if (credited > debt) {
+            pendingReward[user] += credited - debt;
+        }
+        rewardDebt[user] = credited;
+    }
+
+    /// @dev OZ ERC20 v5 hook. Runs on every balance change including
+    ///      mint (from = 0), burn (to = 0), and user transfers. Settle
+    ///      both sides at the pre-change balance, then snapshot
+    ///      rewardDebt at the post-change balance.
+    function _update(address from, address to, uint256 value) internal override {
+        _settleRewards(from);
+        _settleRewards(to);
+
+        super._update(from, to, value);
+
+        if (from != address(0)) {
+            rewardDebt[from] = balanceOf(from) * accRewardPerShare / SCALE;
+        }
+        if (to != address(0)) {
+            rewardDebt[to] = balanceOf(to) * accRewardPerShare / SCALE;
+        }
     }
 }

@@ -5,10 +5,8 @@ import {Script, console2} from "forge-std/Script.sol";
 
 import {ValidatorOracle} from "../src/ValidatorOracle.sol";
 import {InverseQRL, IQsdPool} from "../src/InverseQRL.sol";
-import {QSD, IYieldQSD} from "../src/QSD.sol";
+import {QSD} from "../src/QSD.sol";
 import {PayWithIQRL} from "../src/PayWithIQRL.sol";
-import {YieldQSD} from "../src/YieldQSD.sol";
-import {YieldQSDDesk} from "../src/YieldQSDDesk.sol";
 import {IPriceOracle} from "../src/interfaces/IPriceOracle.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -45,8 +43,6 @@ contract PredeployScript is Script {
     address internal constant IQRL_ADDR      = 0x0000000000000000000000000000000000010001;
     address internal constant QSD_ADDR       = 0x0000000000000000000000000000000000010002;
     address internal constant PAYMASTER_ADDR = 0x0000000000000000000000000000000000010003;
-    address internal constant YIELD_QSD_ADDR = 0x0000000000000000000000000000000000010004;
-    address internal constant DESK_ADDR      = 0x0000000000000000000000000000000000010005;
 
     // Voting params — must match DefaultQSDPredeployParams() in
     // go-qrl/core/qsd_predeploy.go. These bake into the deployed
@@ -79,15 +75,13 @@ contract PredeployScript is Script {
         InverseQRL iqrlSrc = new InverseQRL(IPriceOracle(ORACLE_ADDR), IQsdPool(QSD_ADDR));
         _relocate(address(iqrlSrc), IQRL_ADDR);
 
-        // 3. QSD — constructor takes iqrl + oracle + yieldQsd. yQSD
-        //    hasn't been deployed yet, but its reserved address is
-        //    known, and QSD only calls into it at runtime (during
-        //    leverage facility utilization) — never in the constructor
-        //    — so passing the reserved address is safe.
+        // 3. QSD — constructor takes iqrl + oracle. The yield
+        //    accumulator (formerly a separate YieldQSD contract) now
+        //    lives inside QSD itself: leverage facility fees flow
+        //    through _distributeYield to QSD holders pro-rata.
         QSD qsdSrc = new QSD(
             IERC20(IQRL_ADDR),
-            IPriceOracle(ORACLE_ADDR),
-            IYieldQSD(YIELD_QSD_ADDR)
+            IPriceOracle(ORACLE_ADDR)
         );
         _relocate(address(qsdSrc), QSD_ADDR);
 
@@ -97,17 +91,7 @@ contract PredeployScript is Script {
         PayWithIQRL pmSrc = new PayWithIQRL(IERC20(IQRL_ADDR));
         _relocate(address(pmSrc), PAYMASTER_ADDR);
 
-        // 5. YieldQSD — constructor takes qsd + iqrl. Pass the reserved
-        //    addresses; immutables will resolve to the predeploy slots.
-        YieldQSD yqsdSrc = new YieldQSD(IERC20(QSD_ADDR), IERC20(IQRL_ADDR));
-        _relocate(address(yqsdSrc), YIELD_QSD_ADDR);
-
-        // 6. YieldQSDDesk — OTC quote board for trading yQSD against
-        //    native QRL. Constructor takes the yQSD reference.
-        YieldQSDDesk deskSrc = new YieldQSDDesk(IERC20(YIELD_QSD_ADDR));
-        _relocate(address(deskSrc), DESK_ADDR);
-
-        // 6. Sanity-check the placed contracts respond at the reserved
+        // 5. Sanity-check the placed contracts respond at the reserved
         //    addresses. Any failure here is louder than a silent dump
         //    of broken state.
         require(
@@ -127,36 +111,18 @@ contract PredeployScript is Script {
             "qsd oracle immutable mismatch"
         );
         require(
-            address(QSD(QSD_ADDR).yieldQsd()) == YIELD_QSD_ADDR,
-            "qsd yieldQsd immutable mismatch"
-        );
-        require(
             address(PayWithIQRL(PAYMASTER_ADDR).iqrl()) == IQRL_ADDR,
             "paymaster iqrl immutable mismatch"
         );
-        require(
-            address(YieldQSD(YIELD_QSD_ADDR).qsd()) == QSD_ADDR,
-            "yieldQsd qsd immutable mismatch"
-        );
-        require(
-            address(YieldQSD(YIELD_QSD_ADDR).iqrl()) == IQRL_ADDR,
-            "yieldQsd iqrl immutable mismatch"
-        );
-        require(
-            address(YieldQSDDesk(DESK_ADDR).yqsd()) == YIELD_QSD_ADDR,
-            "desk yqsd immutable mismatch"
-        );
 
-        // 7. Wipe the temp deployer-derived contracts. Without this
+        // 6. Wipe the temp deployer-derived contracts. Without this
         //    they'd clutter vm.dumpState with duplicate code + state.
         _wipe(address(oracleSrc));
         _wipe(address(iqrlSrc));
         _wipe(address(qsdSrc));
         _wipe(address(pmSrc));
-        _wipe(address(yqsdSrc));
-        _wipe(address(deskSrc));
 
-        // 8. Dump.
+        // 7. Dump.
         string memory outPath = "./out/qsd-genesis-state.json";
         vm.dumpState(outPath);
         console2.log("dumped predeploy state to:");
@@ -165,8 +131,6 @@ contract PredeployScript is Script {
         console2.log("iqrl      =", IQRL_ADDR);
         console2.log("qsd       =", QSD_ADDR);
         console2.log("paymaster =", PAYMASTER_ADDR);
-        console2.log("yieldQsd  =", YIELD_QSD_ADDR);
-        console2.log("desk      =", DESK_ADDR);
     }
 
     /// @dev Copy bytecode + the first SLOTS_TO_COPY storage slots from
